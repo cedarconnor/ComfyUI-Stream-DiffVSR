@@ -98,7 +98,7 @@ class FlowEstimator(nn.Module):
         # Optionally rescale flow
         if rescale_factor != 1:
             flow = F.interpolate(
-                flow // rescale_factor,
+                flow / rescale_factor,  # Use float division, not floor division
                 scale_factor=1 / rescale_factor,
                 mode='bilinear',
                 align_corners=False,

@@ -6,7 +6,6 @@ ComfyUI custom node pack wrapping **Stream-DiffVSR** for low-latency video super
 
 **Upstream repo:** https://github.com/jamichss/Stream-DiffVSR  
 **HuggingFace:** https://huggingface.co/Jamichsu/Stream-DiffVSR  
-**License:** Apache-2.0 (NOT MIT - this is critical)  
 **Design doc:** See `ComfyUI-Stream-DiffVSR-Design-Doc.md`
 
 ## Quick Reference
@@ -216,9 +215,6 @@ def to_dict(self):
 from safetensors.torch import save_file
 save_file({"previous_hq": self.previous_hq}, path)
 ```
-
-### ❌ Claiming MIT License
-Upstream is Apache-2.0. Include NOTICE file, attribute authors.
 
 ## File Structure
 

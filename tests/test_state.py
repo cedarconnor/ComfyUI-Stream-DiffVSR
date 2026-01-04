@@ -18,7 +18,7 @@ class TestStreamDiffVSRState:
         state = StreamDiffVSRState()
 
         assert state.previous_hq is None
-        assert state.previous_lq is None
+        assert state.previous_lq_upscaled is None
         assert state.frame_index == 0
         assert not state.has_previous
         assert state.is_first_frame
@@ -26,24 +26,24 @@ class TestStreamDiffVSRState:
     def test_state_with_tensors(self):
         """Test state with tensor data."""
         hq = torch.randn(1, 3, 256, 256)
-        lq = torch.randn(1, 3, 64, 64)
+        lq_upscaled = torch.randn(1, 3, 256, 256)  # 4x upscaled, same as HQ size
 
         state = StreamDiffVSRState(
             previous_hq=hq,
-            previous_lq=lq,
+            previous_lq_upscaled=lq_upscaled,
             frame_index=1,
         )
 
         assert state.has_previous
         assert not state.is_first_frame
         assert state.previous_hq.shape == (1, 3, 256, 256)
-        assert state.previous_lq.shape == (1, 3, 64, 64)
+        assert state.previous_lq_upscaled.shape == (1, 3, 256, 256)
 
     def test_state_clone(self):
         """Test cloning state."""
         original = StreamDiffVSRState(
             previous_hq=torch.randn(1, 3, 256, 256),
-            previous_lq=torch.randn(1, 3, 64, 64),
+            previous_lq_upscaled=torch.randn(1, 3, 256, 256),
             frame_index=5,
             metadata={"test": "value"},
         )
@@ -72,20 +72,20 @@ class TestStreamDiffVSRState:
         """Test moving state to device."""
         state = StreamDiffVSRState(
             previous_hq=torch.randn(1, 3, 256, 256),
-            previous_lq=torch.randn(1, 3, 64, 64),
+            previous_lq_upscaled=torch.randn(1, 3, 256, 256),
         )
 
         # Move to CPU (should work regardless of CUDA availability)
         moved = state.to_device(torch.device("cpu"))
 
         assert moved.previous_hq.device.type == "cpu"
-        assert moved.previous_lq.device.type == "cpu"
+        assert moved.previous_lq_upscaled.device.type == "cpu"
 
     def test_state_serialization(self):
         """Test saving and loading state."""
         original = StreamDiffVSRState(
             previous_hq=torch.randn(1, 3, 256, 256),
-            previous_lq=torch.randn(1, 3, 64, 64),
+            previous_lq_upscaled=torch.randn(1, 3, 256, 256),
             frame_index=42,
             metadata={"key": "value"},
         )
@@ -98,7 +98,7 @@ class TestStreamDiffVSRState:
 
             assert loaded.frame_index == original.frame_index
             assert torch.allclose(loaded.previous_hq, original.previous_hq)
-            assert torch.allclose(loaded.previous_lq, original.previous_lq)
+            assert torch.allclose(loaded.previous_lq_upscaled, original.previous_lq_upscaled)
 
     def test_state_repr(self):
         """Test state string representation."""

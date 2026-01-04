@@ -16,7 +16,6 @@
 
 ### Key Changes in v1.1
 
-1. **License corrected** — Stream-DiffVSR is Apache-2.0, not MIT (Section 14)
 2. **VAE encoding fixed** — Removed hardcoded 0.18215 scaling, use config.scaling_factor (Section 8.1)
 3. **State serialization rewritten** — Replaced tensor-to-list with safetensors (Section 9)
 4. **Tensor layout standardized** — All state tensors are BCHW, conversion at I/O boundaries (Section 8.2)
@@ -1799,49 +1798,6 @@ target-version = ["py310"]
 line-length = 100
 select = ["E", "F", "I", "N", "W"]
 ```
-
----
-
-## 14. License Considerations
-
-### Apache-2.0 License (Required)
-
-Since this node pack vendors/wraps code from the upstream Stream-DiffVSR repository, we must comply with Apache-2.0 obligations:
-
-```
-Copyright 2025 Stream-DiffVSR Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
-### Apache-2.0 Compliance Requirements
-
-1. **NOTICE file** — Must include original copyright notices
-2. **Attribution** — Credit Stream-DiffVSR authors in README
-3. **State Changes** — Document modifications to upstream code
-4. **License Copy** — Include full Apache-2.0 license text
-
-### Upstream License Compatibility
-
-| Component | License | Compatible? | Notes |
-|-----------|---------|-------------|-------|
-| Stream-DiffVSR (code) | Apache-2.0 | ✅ Yes | Must include NOTICE |
-| Stream-DiffVSR (weights) | Apache-2.0 | ✅ Yes | Per HF model card |
-| ComfyUI | GPL-3.0 | ✅ Yes | Apache → GPL compatible |
-| Diffusers | Apache-2.0 | ✅ Yes | Same license |
-| PyTorch | BSD-3-Clause | ✅ Yes | Permissive |
-
-**Important:** The HuggingFace model card for Stream-DiffVSR does NOT claim MIT. Verify license on model card before distribution.
 
 ---
 

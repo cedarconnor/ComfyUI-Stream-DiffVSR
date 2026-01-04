@@ -366,6 +366,7 @@ class StreamDiffVSRPipeline:
             previous_hq=normalize_to_neg1_1(hq_bchw).cpu().float(),  # BCHW, [-1,1]
             previous_lq_upscaled=lq_upscaled.cpu().float(),  # BCHW, [0,1]
             frame_index=state.frame_index + 1,
+            metadata=state.metadata.copy() if state.metadata else {},  # Preserve metadata
         )
 
         return hq_frame, new_state
