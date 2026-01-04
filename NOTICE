@@ -1,0 +1,41 @@
+ComfyUI-Stream-DiffVSR
+Copyright 2026 Cedar
+
+This product includes software developed by the Stream-DiffVSR project
+(https://github.com/jamichss/Stream-DiffVSR).
+
+Stream-DiffVSR
+Copyright 2025 Stream-DiffVSR Authors
+
+Licensed under the Apache License, Version 2.0.
+
+---
+
+This ComfyUI node pack wraps and adapts code from the Stream-DiffVSR
+repository for integration with ComfyUI. The following components are
+derived from or inspired by the upstream implementation:
+
+- Pipeline architecture and inference logic
+- ARTG (Auto-Regressive Temporal Guidance) module integration
+- Temporal-aware VAE decoder with TPM
+- 4-step DDIM scheduler configuration
+- Optical flow warping utilities
+
+Modifications from upstream:
+- Adapted for ComfyUI node interface
+- Added state management for chunked video processing
+- Implemented temporal-aware tiling for memory efficiency
+- Added ComfyUI-specific tensor format conversions (BHWC <-> BCHW)
+
+---
+
+Additional third-party components:
+
+PyTorch - BSD-3-Clause License
+Copyright (c) 2016-present Facebook, Inc.
+
+Diffusers - Apache-2.0 License
+Copyright 2022 The HuggingFace Team
+
+RAFT (Optical Flow) - BSD-3-Clause License
+Copyright (c) 2020 Princeton Vision & Learning Lab
