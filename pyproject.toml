@@ -1,0 +1,74 @@
+[project]
+name = "comfyui-stream-diffvsr"
+version = "1.0.0"
+description = "ComfyUI nodes for Stream-DiffVSR video super-resolution"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Cedar"}
+]
+requires-python = ">=3.10"
+keywords = ["comfyui", "video", "super-resolution", "diffusion", "upscaling", "vsr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "safetensors>=0.4.0",
+    "einops>=0.6.0",
+    "numpy>=1.24.0",
+    "diffusers>=0.25.0,<0.32.0",
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+performance = [
+    "xformers>=0.0.20",
+    "triton>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR"
+Repository = "https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR"
+Documentation = "https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR#readme"
+Upstream = "https://github.com/jamichss/Stream-DiffVSR"
+Issues = "https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR/issues"
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W", "B", "UP"]
+ignore = ["E501"]  # Line length handled by black
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

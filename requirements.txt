@@ -1,0 +1,18 @@
+# ComfyUI-Stream-DiffVSR Dependencies
+# Known-good version ranges for compatibility
+
+# Core dependencies
+torch>=2.0.0,<2.5.0
+torchvision>=0.15.0,<0.20.0
+safetensors>=0.4.0,<1.0.0
+einops>=0.6.0,<1.0.0
+numpy>=1.24.0,<2.0.0
+
+# Diffusers ecosystem - pin to tested range
+diffusers>=0.25.0,<0.32.0
+transformers>=4.30.0,<5.0.0
+accelerate>=0.20.0,<1.0.0
+
+# Optional performance dependencies (uncomment if needed)
+# xformers>=0.0.20  # Memory efficient attention
+# triton>=2.0.0     # For torch.compile optimization
