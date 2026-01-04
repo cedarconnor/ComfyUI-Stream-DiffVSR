@@ -1,23 +1,25 @@
 """
 Main inference pipeline for Stream-DiffVSR.
 
-This pipeline owns the entire denoising loop because ARTG requires
-mid-network feature injection - we cannot use ComfyUI's standard sampler.
+This pipeline owns the entire denoising loop because ControlNet temporal
+guidance requires mid-network feature injection - we cannot use ComfyUI's
+standard sampler.
+
+Architecture:
+- ControlNet: Processes warped previous HQ frame for temporal guidance
+- U-Net: Denoises latents with ControlNet residual injection
+- Temporal VAE: Decodes with TPM feature fusion for temporal consistency
+- RAFT: Estimates optical flow for frame alignment
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple, Callable
-from dataclasses import dataclass
+from typing import Optional, Tuple, Callable, List, Union
+from dataclasses import dataclass, field
 
 from .state import StreamDiffVSRState
-from .models.unet import StreamDiffVSRUNet
-from .models.artg import ARTGModule
-from .models.temporal_decoder import TemporalAwareDecoder
-from .models.flow_estimator import FlowEstimator, ZeroFlowEstimator
-from .schedulers.ddim_4step import DDIM4StepScheduler
 from .utils.image_utils import bhwc_to_bchw, bchw_to_bhwc, normalize_to_neg1_1, denormalize_from_neg1_1
-from .utils.flow_utils import warp_image, upscale_flow
+from .utils.flow_utils import flow_warp
 
 
 @dataclass
@@ -26,9 +28,11 @@ class StreamDiffVSRConfig:
 
     scale_factor: int = 4
     latent_channels: int = 4
-    latent_scale: int = 8  # Spatial downscale in latent space
+    latent_scale: int = 8  # Spatial downscale in latent space (VAE)
     num_inference_steps: int = 4
-    vae_scaling_factor: float = 0.18215  # Will be overridden by VAE config
+    vae_scaling_factor: float = 1.0  # AutoEncoderTiny uses 1.0
+    guidance_scale: float = 0.0  # No CFG by default (as per upstream)
+    controlnet_conditioning_scale: float = 1.0
 
 
 class StreamDiffVSRPipeline:
@@ -39,133 +43,176 @@ class StreamDiffVSRPipeline:
     super-resolution with temporal guidance from previous frames.
 
     CRITICAL: This pipeline owns the denoising loop. We cannot use
-    ComfyUI's KSampler because ARTG injects features mid-network.
+    ComfyUI's KSampler because ControlNet injects features mid-network.
+    
+    Key architecture:
+    - Flow computed on bicubic 4x upscaled images (not LQ resolution)
+    - ControlNet provides temporal guidance via warped previous HQ frame
+    - Temporal VAE decodes with TPM features from warped previous HQ
     """
 
     def __init__(
         self,
-        unet: StreamDiffVSRUNet,
-        artg: ARTGModule,
-        decoder: TemporalAwareDecoder,
-        vae_encoder: torch.nn.Module,
-        flow_estimator: Optional[FlowEstimator],
-        scheduler: DDIM4StepScheduler,
-        config: StreamDiffVSRConfig,
-        device: torch.device,
-        dtype: torch.dtype,
+        unet,
+        controlnet,
+        vae,
+        scheduler,
+        flow_estimator,
+        config: StreamDiffVSRConfig = None,
+        device: torch.device = None,
+        dtype: torch.dtype = torch.float16,
+        text_encoder=None,
+        tokenizer=None,
     ):
         """
         Initialize pipeline.
 
         Args:
-            unet: Distilled U-Net model
-            artg: ARTG temporal guidance module
-            decoder: Temporal-aware VAE decoder
-            vae_encoder: VAE encoder for LQ frames
-            flow_estimator: Optical flow estimator (or None)
-            scheduler: DDIM scheduler
+            unet: UNet2DConditionModel for denoising
+            controlnet: ControlNet for temporal guidance
+            vae: TemporalAutoencoderTiny with TPM
+            scheduler: DDIMScheduler
+            flow_estimator: RAFT optical flow estimator
             config: Pipeline configuration
             device: Target device
             dtype: Model dtype
+            text_encoder: Optional text encoder (for prompts)
+            tokenizer: Optional tokenizer (for prompts)
         """
         self.unet = unet
-        self.artg = artg
-        self.decoder = decoder
-        self.vae_encoder = vae_encoder
-        self.flow_estimator = flow_estimator or ZeroFlowEstimator()
+        self.controlnet = controlnet
+        self.vae = vae
         self.scheduler = scheduler
-        self.config = config
-        self.device = device
+        self.flow_estimator = flow_estimator
+        self.config = config or StreamDiffVSRConfig()
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = dtype
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
 
-        # Move all models to device
-        self._to_device()
+        # Default empty prompt embeddings (no text conditioning)
+        self._empty_prompt_embeds = None
 
-    def _to_device(self):
-        """Move all components to target device and dtype."""
+    def to(self, device=None, dtype=None):
+        """Move pipeline to device/dtype."""
+        if device is not None:
+            self.device = device
+        if dtype is not None:
+            self.dtype = dtype
+            
         self.unet = self.unet.to(self.device, self.dtype)
-        self.artg = self.artg.to(self.device, self.dtype)
-        self.decoder = self.decoder.to(self.device, self.dtype)
-        self.vae_encoder = self.vae_encoder.to(self.device, self.dtype)
+        self.controlnet = self.controlnet.to(self.device, self.dtype)
+        self.vae = self.vae.to(self.device, self.dtype)
         if self.flow_estimator is not None:
             self.flow_estimator = self.flow_estimator.to(self.device)
+        if self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to(self.device, self.dtype)
+        return self
 
-    @torch.inference_mode()
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Encode image to latent space.
-
-        Args:
-            image: (B, H, W, C) tensor in [0, 1] range (ComfyUI format)
-
-        Returns:
-            Latent tensor (B, C, h, w) where h = H/8, w = W/8
-        """
-        # ComfyUI format (BHWC) -> model format (BCHW)
-        x = bhwc_to_bchw(image).to(self.device, self.dtype)
-
-        # Normalize to [-1, 1]
-        x = normalize_to_neg1_1(x)
-
-        # Encode - handle different VAE output types
-        encoder_output = self.vae_encoder.encode(x)
-
-        # diffusers VAEs return distribution objects, not raw tensors
-        if hasattr(encoder_output, "latent_dist"):
-            # Standard diffusers VAE - use mode for deterministic encoding
-            latent = encoder_output.latent_dist.mode()
-        elif hasattr(encoder_output, "latents"):
-            # Some VAEs return .latents directly
-            latent = encoder_output.latents
+    def _get_prompt_embeds(self, batch_size: int = 1) -> torch.Tensor:
+        """Get empty prompt embeddings for unconditional generation."""
+        if self._empty_prompt_embeds is not None:
+            embeds = self._empty_prompt_embeds
+            if embeds.shape[0] != batch_size:
+                embeds = embeds.repeat(batch_size, 1, 1)
+            return embeds.to(self.device, self.dtype)
+        
+        # Create empty prompt embeddings
+        # SD x4 Upscaler expects encoder_hidden_states
+        if self.text_encoder is not None and self.tokenizer is not None:
+            # Use actual text encoder
+            text_inputs = self.tokenizer(
+                [""],
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                text_embeds = self.text_encoder(
+                    text_inputs.input_ids.to(self.device)
+                )[0]
+            self._empty_prompt_embeds = text_embeds
         else:
-            # Raw tensor output (e.g., AutoEncoderTiny)
-            latent = encoder_output
+            # Create dummy embeddings (77 tokens, 1024 dim for SDXL-like)
+            # Actual dimension depends on the model
+            hidden_size = getattr(self.unet.config, 'cross_attention_dim', 1024)
+            self._empty_prompt_embeds = torch.zeros(
+                1, 77, hidden_size, device=self.device, dtype=self.dtype
+            )
+        
+        return self._empty_prompt_embeds.repeat(batch_size, 1, 1).to(self.device, self.dtype)
 
-        # Apply VAE-specific scaling factor from config
-        # DO NOT hardcode 0.18215 - use config value
-        scaling_factor = getattr(
-            self.vae_encoder.config,
-            "scaling_factor",
-            self.config.vae_scaling_factor,
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Prepare initial noise latents."""
+        latent_h = height // self.config.latent_scale
+        latent_w = width // self.config.latent_scale
+        
+        shape = (batch_size, self.config.latent_channels, latent_h, latent_w)
+        latents = torch.randn(
+            shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
         )
-        latent = latent * scaling_factor
-
-        return latent
+        
+        # Scale by scheduler's initial sigma
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
 
     @torch.inference_mode()
-    def estimate_flow(
+    def compute_flows(
         self,
-        current_lq: torch.Tensor,
-        previous_lq: torch.Tensor,
-    ) -> torch.Tensor:
+        upscaled_images: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
         """
-        Estimate optical flow from previous to current frame.
+        Compute optical flows between consecutive upscaled frames.
 
         Args:
-            current_lq: Current LQ frame (B, C, H, W) in [0, 1]
-            previous_lq: Previous LQ frame (B, C, H, W) in [0, 1]
+            upscaled_images: List of 4x bicubic upscaled images (B, C, H, W)
 
         Returns:
-            Flow field (B, 2, H, W)
+            List of flow tensors (B, H, W, 2), one per consecutive pair
         """
-        return self.flow_estimator(previous_lq, current_lq)
+        print('[Stream-DiffVSR] Computing optical flows...')
+        flows = []
+        for i in range(1, len(upscaled_images)):
+            prev_image = upscaled_images[i - 1]
+            cur_image = upscaled_images[i]
+            # Flow from prev to current
+            flow = self.flow_estimator(cur_image, prev_image)
+            flows.append(flow)
+        return flows
 
     @torch.inference_mode()
     def process_frame(
         self,
         lq_frame: torch.Tensor,
         state: StreamDiffVSRState,
+        lq_upscaled: Optional[torch.Tensor] = None,
+        flow: Optional[torch.Tensor] = None,
         num_inference_steps: int = 4,
         seed: int = 0,
+        guidance_scale: float = 0.0,
+        controlnet_conditioning_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
-        Process a single frame with auto-regressive temporal guidance.
+        Process a single frame with ControlNet temporal guidance.
 
         Args:
             lq_frame: Low-quality input frame (1, H, W, C) in [0, 1] BHWC
             state: Previous frame state
+            lq_upscaled: Pre-computed bicubic 4x upscaled LQ (optional)
+            flow: Pre-computed optical flow (optional)
             num_inference_steps: Number of denoising steps
             seed: Random seed
+            guidance_scale: CFG scale (0 = no CFG, as per upstream)
+            controlnet_conditioning_scale: ControlNet strength
 
         Returns:
             hq_frame: High-quality output frame (1, H*4, W*4, C) BHWC
@@ -177,69 +224,134 @@ class StreamDiffVSRPipeline:
         scale = self.config.scale_factor
         target_h, target_w = H * scale, W * scale
 
-        # Convert to model format (BCHW, on device)
+        # Convert to model format (BCHW, [-1, 1])
         lq_bchw = bhwc_to_bchw(lq_frame).to(self.device, self.dtype)
+        lq_normalized = normalize_to_neg1_1(lq_bchw)
 
-        # Encode LQ frame to latent
-        z_lq = self.encode_image(lq_frame)
+        # Bicubic upscale LQ to target resolution (for flow and U-Net input)
+        if lq_upscaled is None:
+            lq_upscaled = F.interpolate(
+                lq_bchw, scale_factor=scale, mode='bicubic', align_corners=False
+            )
+        else:
+            lq_upscaled = lq_upscaled.to(self.device, self.dtype)
+        
+        lq_upscaled_normalized = normalize_to_neg1_1(lq_upscaled)
 
         # Handle temporal guidance
-        warped_hq = None
-        temporal_features = None
+        warped_prev_hq = None
+        dec_temporal_features = None
 
         if state.has_previous:
-            # Previous frame data is available
-            prev_lq = state.previous_lq.to(self.device, self.dtype)
             prev_hq = state.previous_hq.to(self.device, self.dtype)
 
-            # Estimate flow from previous LQ to current LQ
-            flow = self.estimate_flow(lq_bchw, prev_lq)
+            # Compute flow if not provided
+            if flow is None:
+                prev_lq_upscaled = state.previous_lq_upscaled.to(self.device, self.dtype)
+                flow = self.flow_estimator(lq_upscaled, prev_lq_upscaled)
 
-            # Upscale flow to HQ resolution
-            flow_upscaled = upscale_flow(flow, scale)
+            # Warp previous HQ to current frame
+            warped_prev_hq = flow_warp(prev_hq, flow, interp_mode='bilinear')
 
-            # Warp previous HQ using upscaled flow
-            warped_hq = warp_image(prev_hq, flow_upscaled)
+            # Extract temporal features for VAE decoder TPM
+            enc_layer_features = self.vae.encode(warped_prev_hq, return_features_only=True)
+            if isinstance(enc_layer_features, list):
+                dec_temporal_features = enc_layer_features[::-1]  # Reverse for decoder order
+            else:
+                dec_temporal_features = None
 
-            # Get temporal features from ARTG
-            temporal_features = self.artg.encode_temporal(warped_hq, z_lq)
+        # Prepare initial latents
+        latents = self._prepare_latents(B, target_h, target_w, generator)
 
-        # Initialize noise for denoising
-        latent_h = target_h // self.config.latent_scale
-        latent_w = target_w // self.config.latent_scale
+        # Get prompt embeddings (empty for unconditional)
+        prompt_embeds = self._get_prompt_embeds(B)
+        do_cfg = guidance_scale > 1.0
 
-        noise = torch.randn(
-            (B, self.config.latent_channels, latent_h, latent_w),
-            generator=generator,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if do_cfg:
+            # Duplicate embeddings for CFG
+            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds])
 
         # Setup scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        latents = noise * self.scheduler.init_noise_sigma
+        timesteps = self.scheduler.timesteps
+
+        # Reset VAE temporal state
+        if hasattr(self.vae, 'reset_temporal_condition'):
+            self.vae.reset_temporal_condition()
 
         # ===== DENOISING LOOP =====
-        # This is why we own the loop - ARTG injects at each step
-        for t in self.scheduler.timesteps:
-            # U-Net prediction with ARTG temporal conditioning
+        for i, t in enumerate(timesteps):
+            # Prepare latent input
+            if do_cfg:
+                latent_model_input = torch.cat([latents] * 2)
+            else:
+                latent_model_input = latents
+            
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            
+            # Concatenate LQ image to latents (SD x4 Upscaler style)
+            # The upscaled LQ provides structural guidance
+            lq_for_concat = lq_upscaled_normalized
+            if do_cfg:
+                lq_for_concat = torch.cat([lq_for_concat] * 2)
+            
+            # Check if U-Net expects concatenated input
+            unet_in_channels = getattr(self.unet.config, 'in_channels', 4)
+            if unet_in_channels > self.config.latent_channels:
+                # Encode LQ to latent space for concatenation
+                lq_latent = self.vae.encode(lq_upscaled_normalized)
+                if do_cfg:
+                    lq_latent = torch.cat([lq_latent] * 2)
+                latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)
+
+            # ControlNet (temporal guidance from warped previous HQ)
+            if warped_prev_hq is not None and not state.frame_index == 0:
+                controlnet_cond = warped_prev_hq
+                if do_cfg:
+                    controlnet_cond = torch.cat([controlnet_cond] * 2)
+                
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    controlnet_cond=controlnet_cond,
+                    conditioning_scale=controlnet_conditioning_scale,
+                    return_dict=False,
+                )
+            else:
+                # First frame: no temporal conditioning
+                down_block_res_samples = None
+                mid_block_res_sample = None
+
+            # U-Net prediction with ControlNet injection
             noise_pred = self.unet(
-                latents,
+                latent_model_input,
                 t,
-                encoder_hidden_states=z_lq,
-                temporal_features=temporal_features,
-            )
+                encoder_hidden_states=prompt_embeds,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
+                return_dict=False,
+            )[0]
+
+            # CFG guidance
+            if do_cfg:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            step_output = self.scheduler.step(noise_pred, t, latents)
+            latents = step_output.prev_sample
 
-        # ===== TEMPORAL DECODE =====
-        # Decode with temporal-aware decoder
-        hq_bchw = self.decoder(
-            latents,
-            warped_previous=warped_hq,
-            lq_features=z_lq,
-        )
+        # ===== DECODE with Temporal Features =====
+        # Decode latents with TPM temporal feature fusion
+        scaling_factor = getattr(self.vae.config, 'scaling_factor', 1.0)
+        latents_scaled = latents / scaling_factor
+        
+        hq_bchw = self.vae.decode(latents_scaled, temporal_features=dec_temporal_features)
+        
+        # Reset temporal state after decode
+        if hasattr(self.vae, 'reset_temporal_condition'):
+            self.vae.reset_temporal_condition()
 
         # Clamp and convert to [0, 1]
         hq_bchw = torch.clamp(hq_bchw, -1, 1)
@@ -248,10 +360,11 @@ class StreamDiffVSRPipeline:
         # Convert back to ComfyUI format (BHWC, CPU, float32)
         hq_frame = bchw_to_bhwc(hq_bchw).cpu().float()
 
-        # Create new state (store as BCHW for efficiency)
+        # Create new state
+        # Store HQ in normalized [-1, 1] range for next frame's warping
         new_state = StreamDiffVSRState(
-            previous_hq=hq_bchw.cpu().float(),  # BCHW
-            previous_lq=lq_bchw.cpu().float(),  # BCHW
+            previous_hq=normalize_to_neg1_1(hq_bchw).cpu().float(),  # BCHW, [-1,1]
+            previous_lq_upscaled=lq_upscaled.cpu().float(),  # BCHW, [0,1]
             frame_index=state.frame_index + 1,
         )
 
@@ -264,6 +377,8 @@ class StreamDiffVSRPipeline:
         state: Optional[StreamDiffVSRState] = None,
         num_inference_steps: int = 4,
         seed: int = 0,
+        guidance_scale: float = 0.0,
+        controlnet_conditioning_scale: float = 1.0,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
@@ -278,6 +393,8 @@ class StreamDiffVSRPipeline:
             state: Optional previous state for continuing a sequence
             num_inference_steps: Denoising steps per frame (default 4)
             seed: Random seed (incremented per frame)
+            guidance_scale: CFG scale (0 = disabled, as per upstream)
+            controlnet_conditioning_scale: ControlNet strength
             progress_callback: Optional callback(frame_idx, total_frames)
 
         Returns:
@@ -285,23 +402,59 @@ class StreamDiffVSRPipeline:
             final_state: State after last frame
         """
         num_frames = images.shape[0]
+        scale = self.config.scale_factor
 
         # Initialize state if not provided
         if state is None:
             state = StreamDiffVSRState()
 
-        hq_frames = []
-
+        # Pre-compute all LQ upscaled images and flows
+        # (Flow must be computed on upscaled images, not LQ resolution)
+        print('[Stream-DiffVSR] Preparing frames...')
+        lq_upscaled_list = []
         for i in range(num_frames):
-            # Extract single frame (keep batch dim)
-            frame = images[i : i + 1]
+            frame = images[i:i+1]
+            lq_bchw = bhwc_to_bchw(frame).to(self.device, self.dtype)
+            lq_upscaled = F.interpolate(
+                lq_bchw, scale_factor=scale, mode='bicubic', align_corners=False
+            )
+            lq_upscaled_list.append(lq_upscaled)
+
+        # Include previous frame's upscaled LQ for flow computation
+        if state.has_previous:
+            all_upscaled = [state.previous_lq_upscaled.to(self.device, self.dtype)] + lq_upscaled_list
+        else:
+            all_upscaled = lq_upscaled_list
+
+        # Compute flows
+        flows = self.compute_flows(all_upscaled)
+
+        # Process frames
+        hq_frames = []
+        for i in range(num_frames):
+            frame = images[i:i+1]
+            lq_upscaled = lq_upscaled_list[i]
+            
+            # Get flow for this frame
+            if state.has_previous or i > 0:
+                flow_idx = i if state.has_previous else i - 1
+                if flow_idx >= 0 and flow_idx < len(flows):
+                    flow = flows[flow_idx]
+                else:
+                    flow = None
+            else:
+                flow = None
 
             # Process with temporal guidance
             hq_frame, state = self.process_frame(
                 frame,
                 state,
+                lq_upscaled=lq_upscaled,
+                flow=flow,
                 num_inference_steps=num_inference_steps,
-                seed=seed + i,  # Different seed per frame
+                seed=seed + i,
+                guidance_scale=guidance_scale,
+                controlnet_conditioning_scale=controlnet_conditioning_scale,
             )
 
             hq_frames.append(hq_frame)

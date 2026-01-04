@@ -5,13 +5,14 @@ ComfyUI custom nodes for **Stream-DiffVSR** video super-resolution with temporal
 ## Features
 
 - **4x Video Upscaling** - High-quality 4x super-resolution using diffusion
-- **Temporal Consistency** - Auto-regressive temporal guidance prevents flickering
+- **Temporal Consistency** - ControlNet-based temporal guidance prevents flickering
 - **4-Step Inference** - Distilled model optimized for fast 4-step denoising
 - **State Management** - Process long videos in chunks with seamless continuity
+- **Auto-Download** - Models automatically downloaded from HuggingFace
 
 ## Installation
 
-1. Clone into ComfyUI custom nodes:
+### 1. Install custom nodes:
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR
@@ -19,27 +20,29 @@ cd ComfyUI-Stream-DiffVSR
 pip install -r requirements.txt
 ```
 
-2. Download model weights from [HuggingFace](https://huggingface.co/Jamichsu/Stream-DiffVSR) and place in:
+### 2. Download models (Choose one option):
+
+**Option A: Manual Download (Preferred)**
+
+Download from [Jamichsu/Stream-DiffVSR](https://huggingface.co/Jamichsu/Stream-DiffVSR) and place in:
 ```
 ComfyUI/models/StreamDiffVSR/v1/
+├── controlnet/
 ├── unet/
-│   └── diffusion_pytorch_model.safetensors
-├── artg/
-│   └── artg_module.safetensors
-├── temporal_decoder/
-│   └── temporal_decoder.safetensors
 ├── vae/
-│   └── vae_tiny.safetensors
-└── flow/  (optional)
-    └── raft_small.pth
+└── scheduler/
 ```
 
-3. Restart ComfyUI
+**Option B: Auto-Download (Fallback)**
+
+If local models are not found, they will be automatically downloaded from HuggingFace on first use. Models are cached in `~/.cache/huggingface/`.
+
+### 3. Restart ComfyUI
 
 ## Nodes
 
 ### StreamDiffVSR_Loader
-Load all model components. Returns a pipeline object for inference.
+Load all model components from HuggingFace. Returns a pipeline object for inference.
 
 - **model_version**: Model version (default: v1)
 - **device**: cuda / cpu / auto
@@ -92,13 +95,39 @@ This maintains temporal consistency across chunk boundaries.
 ## Technical Details
 
 Stream-DiffVSR uses:
-- **Distilled U-Net** initialized from SD x4 Upscaler
-- **ARTG Module** for temporal feature injection
-- **Temporal-Aware Decoder** with TPM for consistency
-- **RAFT** optical flow for motion alignment
+- **ControlNet** for temporal guidance (warped previous HQ frame)
+- **UNet2DConditionModel** from SD x4 Upscaler (distilled for 4-step)
+- **TemporalAutoencoderTiny** with TPM for temporal feature fusion
+- **RAFT-Large** optical flow for motion alignment
 
 The batch dimension represents frame order. Frame N uses frame N-1's
-upscaled output (warped by optical flow) for temporal guidance.
+upscaled output (warped by optical flow) for temporal guidance via ControlNet.
+
+### Architecture
+
+```
+LQ Frame (t) ──────────────────────────────────────────────────────┐
+     │                                                              │
+     ├── Bicubic 4x ──── Optical Flow ◄──── Previous HQ (t-1)      │
+     │                        │                     │               │
+     │                        ▼                     │               │
+     │                   Flow Warp ─────────────────┘               │
+     │                        │                                     │
+     │                        ▼                                     │
+     │              Warped Previous HQ                              │
+     │                   │         │                                │
+     │                   │         ├── VAE Encode ──► TPM Features  │
+     │                   │         │                       │        │
+     │                   ▼         ▼                       │        │
+     │              ControlNet ──► U-Net ◄─────────────────┘        │
+     │                              │                               │
+     │                              ▼                               │
+     │                      Denoised Latents                        │
+     │                              │                               │
+     └────────────────────────────► VAE Decode (with TPM) ──► HQ Frame (t)
+                                                                    │
+                                               Store for t+1 ◄──────┘
+```
 
 ## License
 
@@ -107,11 +136,17 @@ Apache-2.0 (matching upstream Stream-DiffVSR)
 ## Credits
 
 - **Stream-DiffVSR**: [jamichss/Stream-DiffVSR](https://github.com/jamichss/Stream-DiffVSR)
+- **HuggingFace Model**: [Jamichsu/Stream-DiffVSR](https://huggingface.co/Jamichsu/Stream-DiffVSR)
 - **ComfyUI Integration**: Cedar
 
 ## Status
 
-⚠️ **Development**: Model wrappers are stubs pending upstream architecture study.
+⚠️ **Development**: Model wrappers are being implemented based on upstream architecture.
 
-The project structure and ComfyUI integration is complete. Full functionality
-requires implementing model forward passes based on upstream code.
+Current progress:
+- [x] Project structure and ComfyUI integration
+- [x] Documentation and planning
+- [ ] ControlNet temporal guidance implementation
+- [ ] Temporal VAE with TPM
+- [ ] Full pipeline integration
+- [ ] Testing and validation

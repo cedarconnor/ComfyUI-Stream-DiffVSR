@@ -1,104 +1,184 @@
 """
 U-Net wrapper for Stream-DiffVSR.
 
-Wraps the distilled U-Net model with ARTG feature injection support.
-
-NOTE: This is a stub implementation. The actual model architecture
-must be adapted from the upstream Stream-DiffVSR repository once
-the model weights and architecture are studied.
+Wraps diffusers UNet2DConditionModel with ControlNet residual injection support.
+The U-Net is based on Stable Diffusion x4 Upscaler, distilled for 4-step inference.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 
 
 class StreamDiffVSRUNet(nn.Module):
     """
-    Distilled U-Net for Stream-DiffVSR.
+    U-Net for Stream-DiffVSR denoising.
 
-    This U-Net is initialized from StableVSR / SD x4 Upscaler and
-    fine-tuned with rollout distillation for 4-step inference.
+    This is a wrapper around diffusers UNet2DConditionModel that handles
+    ControlNet residual injection for temporal guidance.
 
-    The key difference from standard U-Net is that it accepts
-    temporal_features from the ARTG module, which are injected
-    into specific decoder layers during denoising.
+    The model accepts:
+    - Noisy latents concatenated with LQ image latents
+    - Text/prompt embeddings (can be empty)
+    - ControlNet residuals (down_block_additional_residuals, mid_block_additional_residual)
     """
 
     def __init__(
         self,
+        unet: nn.Module,
         config: Optional[Dict[str, Any]] = None,
     ):
         """
-        Initialize U-Net.
+        Initialize U-Net wrapper.
 
         Args:
-            config: Model configuration dictionary
+            unet: The underlying UNet2DConditionModel from diffusers
+            config: Optional configuration overrides
         """
         super().__init__()
-        self.config = config or {}
+        self.unet = unet
+        self._config = config or {}
 
-        # Placeholder - actual architecture from upstream
-        self._placeholder = nn.Identity()
-
-        # These will be set during loading
-        self.in_channels = self.config.get("in_channels", 4)
-        self.out_channels = self.config.get("out_channels", 4)
+    @property
+    def config(self):
+        """Return the underlying U-Net config."""
+        return self.unet.config
 
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: torch.Tensor,
+        timestep: Union[torch.Tensor, int],
         encoder_hidden_states: torch.Tensor,
-        temporal_features: Optional[torch.Tensor] = None,
+        down_block_additional_residuals: Optional[List[torch.Tensor]] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+        return_dict: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
-        Forward pass with optional ARTG temporal feature injection.
+        Forward pass with optional ControlNet residual injection.
 
         Args:
-            sample: Noisy latent (B, C, H, W)
-            timestep: Current timestep
-            encoder_hidden_states: Conditioning from LQ encoding
-            temporal_features: Optional ARTG features for injection
+            sample: Noisy latent, possibly concatenated with LQ (B, C, H, W)
+            timestep: Current denoising timestep
+            encoder_hidden_states: Text/prompt embeddings
+            down_block_additional_residuals: ControlNet down block residuals
+                                            (for temporal guidance)
+            mid_block_additional_residual: ControlNet mid block residual
+            return_dict: Whether to return as dict
+            **kwargs: Additional arguments passed to U-Net
 
         Returns:
             Predicted noise (B, C, H, W)
         """
-        # TODO: Implement actual forward pass based on upstream architecture
-        #
-        # The forward pass should:
-        # 1. Run encoder blocks
-        # 2. Run middle block
-        # 3. Run decoder blocks WITH temporal feature injection at specific layers
-        #
-        # The ARTG injection happens at decoder layers, not as a simple addition
-        # to the conditioning. This is why we can't use ComfyUI's standard sampler.
-
-        raise NotImplementedError(
-            "StreamDiffVSRUNet.forward() not yet implemented. "
-            "Please study upstream Stream-DiffVSR architecture and implement."
+        output = self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=down_block_additional_residuals,
+            mid_block_additional_residual=mid_block_additional_residual,
+            return_dict=return_dict,
+            **kwargs,
         )
+
+        if return_dict:
+            return output
+        else:
+            # Return just the sample when not using return_dict
+            return output[0] if isinstance(output, tuple) else output
 
     @classmethod
     def from_pretrained(
         cls,
-        state_dict: Dict[str, torch.Tensor],
-        config: Optional[Dict[str, Any]] = None,
+        pretrained_path: str,
+        subfolder: Optional[str] = "unet",
+        torch_dtype: torch.dtype = torch.float16,
+        **kwargs,
     ) -> "StreamDiffVSRUNet":
         """
         Load U-Net from pretrained weights.
 
+        Supports loading from:
+        1. Local path (e.g., ComfyUI/models/StreamDiffVSR/v1/unet/)
+        2. HuggingFace model ID (e.g., "Jamichsu/Stream-DiffVSR")
+
         Args:
-            state_dict: Model state dictionary
-            config: Optional configuration
+            pretrained_path: Local path or HuggingFace model ID
+            subfolder: Subfolder containing U-Net (for HF format)
+            torch_dtype: Model dtype (default: float16)
+            **kwargs: Additional arguments for from_pretrained
 
         Returns:
-            Loaded model
+            StreamDiffVSRUNet instance
         """
-        model = cls(config=config)
+        try:
+            from diffusers import UNet2DConditionModel
+        except ImportError:
+            raise ImportError(
+                "diffusers is required for U-Net. "
+                "Install with: pip install diffusers>=0.25.0"
+            )
 
-        # TODO: Load weights
-        # model.load_state_dict(state_dict, strict=False)
+        unet = UNet2DConditionModel.from_pretrained(
+            pretrained_path,
+            subfolder=subfolder,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
 
-        return model
+        return cls(unet=unet)
+
+    @classmethod
+    def from_local(
+        cls,
+        model_path: str,
+        torch_dtype: torch.dtype = torch.float16,
+        **kwargs,
+    ) -> "StreamDiffVSRUNet":
+        """
+        Load U-Net from local model files.
+
+        Args:
+            model_path: Path to U-Net directory containing config.json
+                       and model weights
+            torch_dtype: Model dtype
+            **kwargs: Additional arguments
+
+        Returns:
+            StreamDiffVSRUNet instance
+        """
+        try:
+            from diffusers import UNet2DConditionModel
+        except ImportError:
+            raise ImportError(
+                "diffusers is required for U-Net. "
+                "Install with: pip install diffusers>=0.25.0"
+            )
+
+        unet = UNet2DConditionModel.from_pretrained(
+            model_path,
+            subfolder=None,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+
+        return cls(unet=unet)
+
+    def to(self, *args, **kwargs):
+        """Move model to device/dtype."""
+        self.unet = self.unet.to(*args, **kwargs)
+        return self
+
+    def enable_xformers_memory_efficient_attention(self):
+        """Enable xformers for memory-efficient attention."""
+        if hasattr(self.unet, 'enable_xformers_memory_efficient_attention'):
+            self.unet.enable_xformers_memory_efficient_attention()
+
+    def eval(self):
+        """Set model to eval mode."""
+        self.unet.eval()
+        return self
+
+    def train(self, mode: bool = True):
+        """Set model training mode."""
+        self.unet.train(mode)
+        return self

@@ -1,7 +1,9 @@
 """
 Model loader for Stream-DiffVSR components.
 
-Handles discovery and loading of model files from ComfyUI's model directory.
+Supports loading from:
+1. Local path (ComfyUI/models/StreamDiffVSR/v1/) - MANUAL DOWNLOAD
+2. HuggingFace Hub (Jamichsu/Stream-DiffVSR) - AUTO DOWNLOAD (fallback)
 """
 
 import os
@@ -12,24 +14,45 @@ from safetensors.torch import load_file
 from ..exceptions import ModelNotFoundError, ModelLoadError
 
 
+# HuggingFace model ID for auto-download
+HUGGINGFACE_MODEL_ID = "Jamichsu/Stream-DiffVSR"
+
+
 class ModelLoader:
     """
     Handles loading Stream-DiffVSR model components.
 
-    Searches for models in:
-    1. ComfyUI/models/StreamDiffVSR/{version}/
-    2. Custom paths specified by user
+    Loading priority:
+    1. Local path (ComfyUI/models/StreamDiffVSR/{version}/) - preferred
+    2. HuggingFace Hub (auto-download) - fallback
+    
+    Local directory structure:
+    ```
+    ComfyUI/models/StreamDiffVSR/v1/
+    ├── controlnet/              # ControlNet for temporal guidance
+    │   ├── config.json
+    │   └── diffusion_pytorch_model.safetensors
+    ├── unet/                    # U-Net for denoising
+    │   ├── config.json
+    │   └── diffusion_pytorch_model.safetensors
+    ├── vae/                     # Temporal VAE with TPM
+    │   ├── config.json
+    │   └── diffusion_pytorch_model.safetensors
+    └── scheduler/               # DDIM scheduler config
+        └── scheduler_config.json
+    ```
     """
 
     REQUIRED_COMPONENTS = [
+        "controlnet",
         "unet",
-        "artg",
-        "temporal_decoder",
         "vae",
     ]
 
     OPTIONAL_COMPONENTS = [
-        "flow",  # Can fall back to torchvision RAFT
+        "scheduler",
+        "text_encoder",
+        "tokenizer",
     ]
 
     SUPPORTED_EXTENSIONS = [".safetensors", ".pth", ".ckpt", ".bin"]
@@ -117,6 +140,38 @@ class ModelLoader:
         return None
 
     @classmethod
+    def has_local_models(
+        cls,
+        model_path: str,
+        version: str = "v1",
+    ) -> bool:
+        """
+        Check if local model files exist.
+
+        Args:
+            model_path: Base path to StreamDiffVSR models
+            version: Model version (e.g., "v1")
+
+        Returns:
+            True if all required components exist locally
+        """
+        version_path = os.path.join(model_path, version)
+        
+        if not os.path.exists(version_path):
+            # Check if files are directly in model_path (flat structure)
+            version_path = model_path
+
+        for component in cls.REQUIRED_COMPONENTS:
+            component_dir = os.path.join(version_path, component)
+            if not os.path.isdir(component_dir):
+                return False
+            # Check for config.json (diffusers format)
+            if not os.path.exists(os.path.join(component_dir, "config.json")):
+                return False
+
+        return True
+
+    @classmethod
     def validate_model_files(
         cls,
         model_path: str,
@@ -130,7 +185,7 @@ class ModelLoader:
             version: Model version (e.g., "v1")
 
         Returns:
-            Mapping of component name to file path
+            Mapping of component name to directory path
 
         Raises:
             ModelNotFoundError: If required components are missing
@@ -140,7 +195,7 @@ class ModelLoader:
         # Check if version directory exists
         if not os.path.exists(version_path):
             # Maybe files are directly in model_path
-            if cls.find_model_file(os.path.join(model_path, "unet")):
+            if os.path.isdir(os.path.join(model_path, "unet")):
                 version_path = model_path
             else:
                 raise ModelNotFoundError(
@@ -153,10 +208,8 @@ class ModelLoader:
 
         for component in cls.REQUIRED_COMPONENTS:
             component_dir = os.path.join(version_path, component)
-            model_file = cls.find_model_file(component_dir)
-
-            if model_file:
-                component_paths[component] = model_file
+            if os.path.isdir(component_dir):
+                component_paths[component] = component_dir
             else:
                 missing.append(component)
 
@@ -169,9 +222,8 @@ class ModelLoader:
         # Check optional components
         for component in cls.OPTIONAL_COMPONENTS:
             component_dir = os.path.join(version_path, component)
-            model_file = cls.find_model_file(component_dir)
-            if model_file:
-                component_paths[component] = model_file
+            if os.path.isdir(component_dir):
+                component_paths[component] = component_dir
 
         return component_paths
 
@@ -182,7 +234,7 @@ class ModelLoader:
         device: str = "cpu",
     ) -> Dict[str, torch.Tensor]:
         """
-        Load a single model component.
+        Load a single model component state dict.
 
         Args:
             path: Path to model file
@@ -236,5 +288,140 @@ class ModelLoader:
             "latent_channels": 4,
             "latent_scale": 8,
             "num_inference_steps": 4,
-            "vae_scaling_factor": 0.18215,  # Will be overridden by VAE config
+            "vae_scaling_factor": 1.0,  # AutoEncoderTiny uses 1.0
         }
+
+
+def load_pipeline(
+    model_path: Optional[str] = None,
+    version: str = "v1",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    use_local: bool = True,
+    use_huggingface: bool = True,
+):
+    """
+    Load complete Stream-DiffVSR pipeline.
+
+    Loading priority:
+    1. Local models (if use_local=True and models exist)
+    2. HuggingFace (if use_huggingface=True)
+
+    Args:
+        model_path: Custom local model path (optional)
+        version: Model version for local loading
+        device: Target device
+        dtype: Model dtype
+        use_local: Whether to try local loading first
+        use_huggingface: Whether to fall back to HuggingFace
+
+    Returns:
+        StreamDiffVSRPipeline instance
+    """
+    from .controlnet import TemporalControlNet
+    from .unet import StreamDiffVSRUNet
+    from .temporal_vae import TemporalVAE
+    from .flow_estimator import get_flow_estimator
+    from ..pipeline import StreamDiffVSRPipeline, StreamDiffVSRConfig
+    
+    try:
+        from diffusers import DDIMScheduler
+    except ImportError:
+        raise ImportError("diffusers is required. Install with: pip install diffusers>=0.25.0")
+
+    # Determine loading source
+    use_local_path = False
+    local_path = None
+    
+    if use_local:
+        try:
+            if model_path:
+                local_path = model_path
+            else:
+                local_path = ModelLoader.get_model_path()
+            
+            if ModelLoader.has_local_models(local_path, version):
+                use_local_path = True
+                print(f"[Stream-DiffVSR] Loading from local: {local_path}/{version}")
+            else:
+                print(f"[Stream-DiffVSR] Local models not found at {local_path}/{version}")
+        except ModelNotFoundError:
+            print("[Stream-DiffVSR] Local model directory not found")
+
+    if use_local_path:
+        # Load from local paths
+        version_path = os.path.join(local_path, version)
+        if not os.path.exists(version_path):
+            version_path = local_path
+        
+        controlnet = TemporalControlNet.from_local(
+            os.path.join(version_path, "controlnet"),
+            torch_dtype=dtype,
+        )
+        unet = StreamDiffVSRUNet.from_local(
+            os.path.join(version_path, "unet"),
+            torch_dtype=dtype,
+        )
+        vae = TemporalVAE.from_local(
+            os.path.join(version_path, "vae"),
+            torch_dtype=dtype,
+        )
+        scheduler = DDIMScheduler.from_pretrained(
+            version_path,
+            subfolder="scheduler",
+        )
+        
+    elif use_huggingface:
+        # Load from HuggingFace
+        print(f"[Stream-DiffVSR] Loading from HuggingFace: {HUGGINGFACE_MODEL_ID}")
+        
+        controlnet = TemporalControlNet.from_pretrained(
+            HUGGINGFACE_MODEL_ID,
+            subfolder="controlnet",
+            torch_dtype=dtype,
+        )
+        unet = StreamDiffVSRUNet.from_pretrained(
+            HUGGINGFACE_MODEL_ID,
+            subfolder="unet",
+            torch_dtype=dtype,
+        )
+        vae = TemporalVAE.from_pretrained(
+            HUGGINGFACE_MODEL_ID,
+            subfolder="vae",
+            torch_dtype=dtype,
+        )
+        scheduler = DDIMScheduler.from_pretrained(
+            HUGGINGFACE_MODEL_ID,
+            subfolder="scheduler",
+        )
+    else:
+        raise ModelNotFoundError(
+            "Stream-DiffVSR models",
+            "No loading source available. Enable use_local or use_huggingface.",
+        )
+
+    # Load flow estimator (always from torchvision)
+    flow_estimator = get_flow_estimator(device=device)
+
+    # Create pipeline config
+    config = StreamDiffVSRConfig(
+        scale_factor=4,
+        latent_channels=4,
+        latent_scale=8,
+        num_inference_steps=4,
+        vae_scaling_factor=1.0,
+    )
+
+    # Create pipeline
+    pipeline = StreamDiffVSRPipeline(
+        unet=unet.to(device),
+        controlnet=controlnet.to(device),
+        vae=vae.to(device),
+        scheduler=scheduler,
+        flow_estimator=flow_estimator,
+        config=config,
+        device=torch.device(device),
+        dtype=dtype,
+    )
+
+    return pipeline

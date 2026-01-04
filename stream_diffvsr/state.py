@@ -8,6 +8,10 @@ TENSOR LAYOUT CONVENTION:
 All tensors in state use BCHW format (model-native) to avoid
 repeated permutations during processing. Conversion to ComfyUI's
 BHWC format happens only at node I/O boundaries.
+
+VALUE RANGE CONVENTION:
+- previous_hq: BCHW, float32, [-1, 1] (normalized for warping/encode)
+- previous_lq_upscaled: BCHW, float32, [0, 1] (for flow computation)
 """
 
 from dataclasses import dataclass, field
@@ -25,20 +29,21 @@ class StreamDiffVSRState:
 
     Attributes:
         previous_hq: Previous high-quality output frame.
-                     Shape: (1, 3, H*scale, W*scale), BCHW, float32, [0,1]
-        previous_lq: Previous low-quality input frame.
-                     Shape: (1, 3, H, W), BCHW, float32, [0,1]
-                     Needed for optical flow estimation.
+                     Shape: (1, 3, H*4, W*4), BCHW, float32, [-1,1]
+                     Used for warping and ControlNet conditioning.
+        previous_lq_upscaled: Previous bicubic 4x upscaled LQ frame.
+                              Shape: (1, 3, H*4, W*4), BCHW, float32, [0,1]
+                              Used for optical flow estimation.
         frame_index: Frame index in current sequence (0-indexed).
         metadata: Optional metadata (resolution, dtype, etc.)
     """
 
-    # Previous high-quality output frame (BCHW, float32, [0,1])
+    # Previous high-quality output frame (BCHW, float32, [-1,1])
     previous_hq: Optional[torch.Tensor] = None
 
-    # Previous low-quality input frame (BCHW, float32, [0,1])
-    # Needed for optical flow estimation between frames
-    previous_lq: Optional[torch.Tensor] = None
+    # Previous bicubic 4x upscaled LQ frame (BCHW, float32, [0,1])
+    # Flow is computed between upscaled images, not original LQ
+    previous_lq_upscaled: Optional[torch.Tensor] = None
 
     # Frame index in current sequence (0-indexed)
     frame_index: int = 0
@@ -49,7 +54,7 @@ class StreamDiffVSRState:
     @property
     def has_previous(self) -> bool:
         """Check if previous frame data is available for temporal guidance."""
-        return self.previous_hq is not None and self.previous_lq is not None
+        return self.previous_hq is not None and self.previous_lq_upscaled is not None
 
     @property
     def is_first_frame(self) -> bool:
@@ -64,7 +69,7 @@ class StreamDiffVSRState:
         """Create a deep copy of this state."""
         return StreamDiffVSRState(
             previous_hq=self.previous_hq.clone() if self.previous_hq is not None else None,
-            previous_lq=self.previous_lq.clone() if self.previous_lq is not None else None,
+            previous_lq_upscaled=self.previous_lq_upscaled.clone() if self.previous_lq_upscaled is not None else None,
             frame_index=self.frame_index,
             metadata=self.metadata.copy(),
         )
@@ -73,7 +78,7 @@ class StreamDiffVSRState:
         """Move state tensors to specified device."""
         return StreamDiffVSRState(
             previous_hq=self.previous_hq.to(device) if self.previous_hq is not None else None,
-            previous_lq=self.previous_lq.to(device) if self.previous_lq is not None else None,
+            previous_lq_upscaled=self.previous_lq_upscaled.to(device) if self.previous_lq_upscaled is not None else None,
             frame_index=self.frame_index,
             metadata=self.metadata.copy(),
         )
@@ -103,8 +108,8 @@ class StreamDiffVSRState:
 
         if self.previous_hq is not None:
             tensors["previous_hq"] = self.previous_hq.contiguous().cpu()
-        if self.previous_lq is not None:
-            tensors["previous_lq"] = self.previous_lq.contiguous().cpu()
+        if self.previous_lq_upscaled is not None:
+            tensors["previous_lq_upscaled"] = self.previous_lq_upscaled.contiguous().cpu()
 
         # safetensors requires at least one tensor
         if not tensors:
@@ -143,22 +148,26 @@ class StreamDiffVSRState:
 
         # Get tensors (excluding placeholder)
         previous_hq = tensors.get("previous_hq")
-        previous_lq = tensors.get("previous_lq")
+        previous_lq_upscaled = tensors.get("previous_lq_upscaled")
+        
+        # Backwards compatibility: check for old previous_lq key
+        if previous_lq_upscaled is None:
+            previous_lq_upscaled = tensors.get("previous_lq")
 
         return cls(
             previous_hq=previous_hq,
-            previous_lq=previous_lq,
+            previous_lq_upscaled=previous_lq_upscaled,
             frame_index=frame_index,
             metadata=metadata,
         )
 
     def __repr__(self) -> str:
         hq_shape = tuple(self.previous_hq.shape) if self.previous_hq is not None else None
-        lq_shape = tuple(self.previous_lq.shape) if self.previous_lq is not None else None
+        lq_shape = tuple(self.previous_lq_upscaled.shape) if self.previous_lq_upscaled is not None else None
         return (
             f"StreamDiffVSRState("
             f"frame_index={self.frame_index}, "
             f"has_previous={self.has_previous}, "
             f"hq_shape={hq_shape}, "
-            f"lq_shape={lq_shape})"
+            f"lq_upscaled_shape={lq_shape})"
         )

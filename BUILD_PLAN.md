@@ -1,435 +1,428 @@
 # ComfyUI-Stream-DiffVSR Build Plan
 
-**Status:** Ready to Implement
-**Based on:** Design Doc v1.1 + CLAUDE.md
+**Status:** Ready to Implement  
+**Based on:** Upstream analysis of https://github.com/jamichss/Stream-DiffVSR  
+**Last Updated:** January 2026
 
 ---
 
 ## Summary
 
-This plan implements a ComfyUI custom node pack wrapping **Stream-DiffVSR** for 4x video super-resolution with temporal guidance. The core insight is that we **cannot** use ComfyUI's standard sampler infrastructure - the ARTG module requires mid-network feature injection during denoising.
+This plan implements a ComfyUI custom node pack wrapping **Stream-DiffVSR** for 4x video super-resolution with temporal guidance. 
 
-### Key Architecture Decisions
+### Key Architecture (Post-Analysis)
+
+The upstream implementation uses **standard diffusers components**, not custom modules:
+
+| Component | Actual Implementation |
+|-----------|----------------------|
+| "ARTG" | **ControlNet** - warped previous HQ as conditioning |
+| U-Net | **UNet2DConditionModel** from diffusers |
+| Temporal VAE | **TemporalAutoencoderTiny** (custom, but straightforward) |
+| Flow | **RAFT-Large** from torchvision |
+| Scheduler | **DDIMScheduler** from diffusers |
+
+### Critical Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Self-contained pipeline | ARTG injects at U-Net decoder layers mid-denoising |
-| Wrap upstream inference | Fast MVP, guaranteed correctness vs clean diffusers |
+| Use ControlNet directly | Matches upstream exactly, simpler than custom ARTG |
+| HuggingFace loading | Auto-download from `Jamichsu/Stream-DiffVSR` |
+| Self-contained pipeline | ControlNet injects at U-Net residuals during denoising |
 | Batch = time convention | Process frames sequentially for temporal guidance |
-| BCHW state tensors | Avoid repeated permutations, convert at I/O boundaries |
+| BCHW state tensors | Match internal format, convert at I/O boundaries |
 | Apache-2.0 license | Match upstream, include NOTICE file |
 
 ---
 
-## Phase 1: Project Skeleton & Infrastructure
+## Phase 1: Project Structure Updates
 
-### 1.1 Create Directory Structure
+### 1.1 Rename/Restructure Model Files
 
 ```
-ComfyUI-Stream-DiffVSR/
-├── __init__.py                 # Node registration + version check
-├── LICENSE                     # Apache-2.0 (copy full text)
-├── NOTICE                      # Attribution to upstream authors
-├── README.md                   # User documentation
-├── requirements.txt            # Dependencies
-├── pyproject.toml              # Package metadata
-│
-├── nodes/
-│   ├── __init__.py
-│   ├── loader_node.py          # StreamDiffVSR_Loader
-│   ├── upscale_node.py         # StreamDiffVSR_Upscale
-│   ├── process_frame_node.py   # StreamDiffVSR_ProcessFrame
-│   └── state_nodes.py          # CreateState, ExtractState
-│
-├── stream_diffvsr/
-│   ├── __init__.py
-│   ├── pipeline.py             # Main inference pipeline
-│   ├── state.py                # StreamDiffVSRState dataclass
-│   ├── compat.py               # Version checks, defensive imports
-│   ├── exceptions.py           # Custom exceptions
-│   │
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── loader.py           # Model file discovery/loading
-│   │   ├── unet.py             # Distilled U-Net wrapper
-│   │   ├── artg.py             # Auto-Regressive Temporal Guidance
-│   │   ├── temporal_decoder.py # VAE decoder with TPM
-│   │   └── flow_estimator.py   # RAFT wrapper
-│   │
-│   ├── schedulers/
-│   │   ├── __init__.py
-│   │   └── ddim_4step.py       # 4-step DDIM
-│   │
-│   └── utils/
-│       ├── __init__.py
-│       ├── image_utils.py      # Tensor conversions
-│       ├── flow_utils.py       # Warp operations
-│       ├── tiling.py           # Temporal-aware tiling
-│       └── device_utils.py     # Device/dtype management
-│
-├── example_workflows/
-│   ├── basic_upscale.json
-│   └── vhs_integration.json
-│
-└── tests/
-    ├── __init__.py
-    ├── test_state.py
-    ├── test_pipeline.py
-    └── fixtures/
+stream_diffvsr/models/
+├── __init__.py           # Updated exports
+├── loader.py             # HuggingFace model loading
+├── controlnet.py         # ControlNet wrapper (replaces artg.py)
+├── unet.py               # UNet2DConditionModel wrapper
+├── temporal_vae.py       # TemporalAutoencoderTiny (replaces temporal_decoder.py)
+└── flow_estimator.py     # RAFT-Large from torchvision
 ```
 
-### 1.2 Create Base Files
+### 1.2 Delete Obsolete Files
 
-**Files to create:**
-- [ ] `LICENSE` - Apache-2.0 full text
-- [ ] `NOTICE` - Attribution (Stream-DiffVSR authors, year 2025)
-- [ ] `requirements.txt` - Pin to known-good versions
-- [ ] `pyproject.toml` - Package metadata
-- [ ] `stream_diffvsr/compat.py` - Version checks
-- [ ] `stream_diffvsr/exceptions.py` - Custom exceptions
+- [ ] Delete `stream_diffvsr/models/artg.py` (replaced by controlnet.py)
+- [ ] Rename concepts throughout documentation
 
-### 1.3 Dependencies
+### 1.3 Update Dependencies
 
 ```
 # requirements.txt
 torch>=2.0.0,<2.5.0
 torchvision>=0.15.0,<0.20.0
-safetensors>=0.4.0,<1.0.0
-einops>=0.6.0,<1.0.0
-numpy>=1.24.0,<2.0.0
 diffusers>=0.25.0,<0.32.0
 transformers>=4.30.0,<5.0.0
+safetensors>=0.4.0,<1.0.0
 accelerate>=0.20.0,<1.0.0
 ```
 
 ---
 
-## Phase 2: Core Pipeline Implementation
+## Phase 2: Utility Implementation
 
-### 2.1 Study Upstream Code (CRITICAL FIRST STEP)
+### 2.1 Flow Utilities
 
-**Before writing any code**, fetch and study the upstream repo:
+**File:** `stream_diffvsr/utils/flow_utils.py`
 
-```bash
-git clone https://github.com/jamichss/Stream-DiffVSR /tmp/Stream-DiffVSR
+Implement from upstream:
+```python
+def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros'):
+    """Warp image/features with optical flow.
+    
+    Args:
+        x: (B, C, H, W) tensor
+        flow: (B, 2, H, W) or (B, H, W, 2) tensor
+    
+    Returns:
+        Warped tensor (B, C, H, W)
+    """
+    # Handle flow format
+    if flow.dim() == 4 and flow.shape[1] == 2:
+        flow = flow.permute(0, 2, 3, 1)  # (B, 2, H, W) -> (B, H, W, 2)
+    
+    # Create sampling grid
+    _, _, H, W = x.size()
+    grid_y, grid_x = torch.meshgrid(torch.arange(H), torch.arange(W))
+    grid = torch.stack((grid_x, grid_y), 2).float().to(x.device)
+    vgrid = grid + flow
+    
+    # Normalize to [-1, 1]
+    vgrid_x = 2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0
+    vgrid_y = 2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0
+    vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
+    
+    return F.grid_sample(x, vgrid_scaled, mode=interp_mode, 
+                         padding_mode=padding_mode, align_corners=False)
 ```
 
-**Questions to answer from upstream:**
-1. Does VAE use `latent_dist.sample()` or `.mode()` for encode?
-2. Exact ARTG injection point in U-Net decoder layers?
-3. Flow estimation model (RAFT variant, config)?
-4. VAE scaling factor in shipped config?
-5. How does temporal decoder handle first frame (no previous)?
-6. Scheduler implementation details (DDIM 4-step)?
+### 2.2 Image Utilities
 
-**Key files to study:**
-- `inference.py` - Entry point, copy this logic
-- `pipeline/` - Pipeline class structure
-- `scheduler/` - DDIM implementation
-- `temporal_autoencoder/` - Decoder with TPM
-- `util/` - Flow, warping utilities
+**File:** `stream_diffvsr/utils/image_utils.py`
 
-### 2.2 Implement State Management
+- BHWC ↔ BCHW conversion
+- [0,1] ↔ [-1,1] normalization
+- Bicubic 4x upscaling for flow computation
 
-**File:** `stream_diffvsr/state.py`
+---
+
+## Phase 3: Model Wrappers
+
+### 3.1 ControlNet (Temporal Guidance)
+
+**File:** `stream_diffvsr/models/controlnet.py`
 
 ```python
-@dataclass
-class StreamDiffVSRState:
-    previous_hq: Optional[torch.Tensor] = None  # BCHW, [0,1]
-    previous_lq: Optional[torch.Tensor] = None  # BCHW, [0,1]
-    frame_index: int = 0
-    metadata: dict = field(default_factory=dict)
+from diffusers import ControlNetModel
+
+class TemporalControlNet:
+    """ControlNet for temporal guidance from warped previous frame."""
+    
+    @classmethod
+    def from_pretrained(cls, model_id, subfolder="controlnet", **kwargs):
+        return ControlNetModel.from_pretrained(
+            model_id, subfolder=subfolder, **kwargs
+        )
 ```
 
-**Key features:**
-- BCHW tensor format (model-native)
-- `has_previous` property for conditional logic
-- `save_state()` / `load_state()` using safetensors (NOT Python lists)
-- `clone()` and `to_device()` methods
+### 3.2 U-Net
 
-### 2.3 Implement Utility Functions
+**File:** `stream_diffvsr/models/unet.py`
 
-**Files:**
-- `stream_diffvsr/utils/image_utils.py`
-  - BHWC ↔ BCHW conversion
-  - [0,1] ↔ [-1,1] normalization
-  - Tensor dtype handling
+```python
+from diffusers import UNet2DConditionModel
 
-- `stream_diffvsr/utils/flow_utils.py`
-  - `warp_image(image, flow)` - Backward warping
-  - Flow upscaling for HQ resolution
+class StreamDiffVSRUNet:
+    """U-Net wrapper with ControlNet residual injection."""
+    
+    @classmethod
+    def from_pretrained(cls, model_id, subfolder="unet", **kwargs):
+        return UNet2DConditionModel.from_pretrained(
+            model_id, subfolder=subfolder, **kwargs
+        )
+```
 
-- `stream_diffvsr/utils/device_utils.py`
-  - Device detection (cuda/cpu/auto)
-  - Dtype handling (fp16/bf16/fp32)
+### 3.3 Temporal VAE
 
-### 2.4 Implement Model Wrappers
+**File:** `stream_diffvsr/models/temporal_vae.py`
 
-**Files (ordered by dependency):**
+Need to vendor `TemporalAutoencoderTiny` from upstream or create adapter:
 
-1. `stream_diffvsr/models/loader.py`
-   - `get_model_path()` - Find StreamDiffVSR folder
-   - `validate_model_files()` - Check required components exist
-   - `load_component()` - Load safetensors/pth files
+```python
+class TemporalVAE:
+    """Temporal-aware VAE with TPM for feature fusion."""
+    
+    def encode(self, x, return_features_only=False):
+        """Encode image, optionally returning layer features for TPM."""
+        pass
+    
+    def decode(self, latents, temporal_features=None):
+        """Decode with optional temporal feature fusion via TPM."""
+        pass
+    
+    def reset_temporal_condition(self):
+        """Reset TPM state between frames."""
+        pass
+```
 
-2. `stream_diffvsr/models/flow_estimator.py`
-   - `FlowEstimator` class wrapping RAFT
-   - Check for existing RAFT from other nodes first
-   - Fallback to bundled/torchvision RAFT
+### 3.4 Flow Estimator
 
-3. `stream_diffvsr/models/artg.py`
-   - `ARTGModule` wrapping upstream ARTG
-   - `encode_temporal(warped_hq, z_lq)` method
-   - Returns features for U-Net injection
+**File:** `stream_diffvsr/models/flow_estimator.py`
 
-4. `stream_diffvsr/models/unet.py`
-   - `StreamDiffVSRUNet` wrapper
-   - Forward pass accepts `temporal_features` parameter
-   - Inject ARTG features at correct decoder layers
+```python
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
-5. `stream_diffvsr/models/temporal_decoder.py`
-   - `TemporalAwareDecoder` with TPM
-   - Forward pass accepts `warped_previous` and `lq_features`
+class FlowEstimator:
+    """RAFT-Large optical flow estimator."""
+    
+    def __init__(self, device='cuda'):
+        self.model = raft_large(weights=Raft_Large_Weights.DEFAULT)
+        self.model = self.model.to(device).eval()
+        self.model.requires_grad_(False)
+    
+    def __call__(self, target, source):
+        """Estimate flow from source to target."""
+        flows = self.model(target, source)
+        return flows[-1].permute(0, 2, 3, 1)  # (B, H, W, 2)
+```
 
-### 2.5 Implement Scheduler
+---
 
-**File:** `stream_diffvsr/schedulers/ddim_4step.py`
+## Phase 4: Scheduler
 
-- Copy/adapt upstream DDIM implementation
-- `set_timesteps(num_steps)` method
-- `step(noise_pred, t, latents)` method
-- Default to 4 steps as optimized by distillation
+**File:** `stream_diffvsr/schedulers/ddim.py`
 
-### 2.6 Implement Main Pipeline
+Use diffusers DDIMScheduler directly:
+
+```python
+from diffusers import DDIMScheduler
+
+def create_scheduler(model_id):
+    return DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
+```
+
+---
+
+## Phase 5: Pipeline Implementation
 
 **File:** `stream_diffvsr/pipeline.py`
 
+Major changes from stub:
+
 ```python
 class StreamDiffVSRPipeline:
-    def __init__(self, unet, artg, decoder, vae_encoder,
-                 flow_estimator, scheduler, config, device, dtype):
-        ...
-
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """BHWC [0,1] -> latent BCHW"""
-        # Use config.scaling_factor, NOT hardcoded 0.18215
-
-    def estimate_flow(self, current_lq, previous_lq) -> torch.Tensor:
-        """Estimate optical flow between frames"""
-
-    def process_frame(self, lq_frame, state, num_steps=4, seed=0):
-        """
-        Single frame processing with ARTG injection.
-
-        1. Convert BHWC -> BCHW
-        2. Encode LQ to latent
-        3. If has_previous: compute flow, warp HQ, get ARTG features
-        4. Denoising loop with ARTG injection at each step
-        5. Temporal decoder with warped_previous
-        6. Convert BCHW -> BHWC, update state
-        """
-
-    def __call__(self, images, state=None, num_steps=4, seed=0):
-        """Batch processing - loop over frames internally"""
+    def __init__(self, unet, controlnet, vae, scheduler, flow_estimator, ...):
+        self.unet = unet
+        self.controlnet = controlnet  # Replaces ARTG
+        self.vae = vae  # TemporalAutoencoderTiny
+        self.scheduler = scheduler  # DDIMScheduler
+        self.flow_estimator = flow_estimator  # RAFT-Large
+    
+    def compute_flows(self, images):
+        """Compute forward flows between UPSCALED frames."""
+        # images are already bicubic 4x upscaled
+        flows = []
+        for i in range(1, len(images)):
+            flow = self.flow_estimator(images[i], images[i-1])
+            flows.append(flow)
+        return flows
+    
+    def process_frame(self, lq_frame, state, ...):
+        """Process single frame with ControlNet temporal guidance."""
+        
+        # 1. Bicubic upscale LQ to target resolution
+        lq_upscaled = F.interpolate(lq_frame, scale_factor=4, mode='bicubic')
+        
+        # 2. Get temporal conditioning if not first frame
+        if state.has_previous:
+            # Warp previous HQ to current frame
+            warped_prev = flow_warp(state.previous_hq, state.flow)
+            
+            # Extract TPM features
+            temporal_features = self.vae.encode(
+                warped_prev, return_features_only=True
+            )[::-1]
+        else:
+            warped_prev = None
+            temporal_features = None
+        
+        # 3. Denoising loop with ControlNet
+        latents = self.prepare_latents(...)
+        
+        for t in self.scheduler.timesteps:
+            # ControlNet (temporal guidance)
+            if warped_prev is not None:
+                down_samples, mid_sample = self.controlnet(
+                    latents, t,
+                    encoder_hidden_states=prompt_embeds,
+                    controlnet_cond=warped_prev,
+                    return_dict=False
+                )
+            else:
+                down_samples, mid_sample = None, None
+            
+            # U-Net with ControlNet injection
+            noise_pred = self.unet(
+                latents, t,
+                encoder_hidden_states=prompt_embeds,
+                down_block_additional_residuals=down_samples,
+                mid_block_additional_residual=mid_sample,
+                return_dict=False
+            )[0]
+            
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+        
+        # 4. Decode with temporal features
+        hq_frame = self.vae.decode(latents, temporal_features=temporal_features)
+        
+        # 5. Update state
+        new_state = StreamDiffVSRState(
+            previous_hq=hq_frame,
+            frame_index=state.frame_index + 1
+        )
+        
+        return hq_frame, new_state
 ```
-
-**Critical implementation notes:**
-- VAE scaling: Use `vae.config.scaling_factor`, not 0.18215
-- ARTG features inject INTO U-Net decoder, not as conditioning
-- First frame: No temporal guidance (warped_hq=None, temporal_features=None)
 
 ---
 
-## Phase 3: ComfyUI Nodes
+## Phase 6: Model Loading
 
-### 3.1 Node Registration
-
-**File:** `__init__.py`
+**File:** `stream_diffvsr/models/loader.py`
 
 ```python
-NODE_CLASS_MAPPINGS = {
-    "StreamDiffVSR_Loader": StreamDiffVSR_Loader,
-    "StreamDiffVSR_Upscale": StreamDiffVSR_Upscale,
-    "StreamDiffVSR_ProcessFrame": StreamDiffVSR_ProcessFrame,
-    "StreamDiffVSR_CreateState": StreamDiffVSR_CreateState,
-    "StreamDiffVSR_ExtractState": StreamDiffVSR_ExtractState,
-}
+MODEL_ID = "Jamichsu/Stream-DiffVSR"
+
+def load_pipeline(device='cuda', dtype=torch.float16):
+    """Load complete pipeline from HuggingFace."""
+    
+    controlnet = ControlNetModel.from_pretrained(
+        MODEL_ID, subfolder="controlnet", torch_dtype=dtype
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        MODEL_ID, subfolder="unet", torch_dtype=dtype
+    )
+    vae = TemporalAutoencoderTiny.from_pretrained(
+        MODEL_ID, subfolder="vae", torch_dtype=dtype
+    )
+    scheduler = DDIMScheduler.from_pretrained(
+        MODEL_ID, subfolder="scheduler"
+    )
+    flow_estimator = FlowEstimator(device=device)
+    
+    return StreamDiffVSRPipeline(
+        unet=unet.to(device),
+        controlnet=controlnet.to(device),
+        vae=vae.to(device),
+        scheduler=scheduler,
+        flow_estimator=flow_estimator,
+        device=device,
+        dtype=dtype
+    )
 ```
 
-### 3.2 Loader Node
+---
 
-**File:** `nodes/loader_node.py`
+## Phase 7: Node Updates
+
+### 7.1 Loader Node
+
+Update to use HuggingFace loading:
 
 ```python
 class StreamDiffVSR_Loader:
-    CATEGORY = "StreamDiffVSR"
-    RETURN_TYPES = ("STREAM_DIFFVSR_PIPE",)
-    FUNCTION = "load_model"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model_version": (["v1"],),
-                "device": (["cuda", "cpu", "auto"],),
-                "dtype": (["float16", "bfloat16", "float32"],),
-            }
-        }
+    def load_model(self, model_version, device, dtype):
+        from stream_diffvsr.models.loader import load_pipeline
+        return (load_pipeline(device=device, dtype=dtype),)
 ```
 
-**Implementation:**
-1. Get model path via folder_paths
-2. Validate all components exist
-3. Load each component (unet, artg, decoder, vae, flow)
-4. Create scheduler
-5. Construct and return StreamDiffVSRPipeline
+### 7.2 Upscale Node
 
-### 3.3 Main Upscale Node
-
-**File:** `nodes/upscale_node.py`
-
-```python
-class StreamDiffVSR_Upscale:
-    CATEGORY = "StreamDiffVSR"
-    RETURN_TYPES = ("IMAGE", "STREAM_DIFFVSR_STATE")
-    FUNCTION = "upscale"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pipe": ("STREAM_DIFFVSR_PIPE",),
-                "images": ("IMAGE",),  # Batch = frames in order
-            },
-            "optional": {
-                "state": ("STREAM_DIFFVSR_STATE",),
-                "num_inference_steps": ("INT", {"default": 4, "min": 1, "max": 50}),
-                "seed": ("INT", {"default": 0}),
-                "enable_tiling": ("BOOLEAN", {"default": False}),
-                "tile_size": ("INT", {"default": 512}),
-                "tile_overlap": ("INT", {"default": 64}),
-            }
-        }
-```
-
-**Implementation:**
-1. Initialize state if None
-2. Loop over batch dimension (frames)
-3. Call `pipeline.process_frame()` for each
-4. Stack results back to batch
-5. Return (images, final_state)
-
-### 3.4 Advanced Nodes
-
-**File:** `nodes/process_frame_node.py`
-- Single frame with explicit state I/O
-- For custom loops, VHS integration
-
-**File:** `nodes/state_nodes.py`
-- `StreamDiffVSR_CreateState` - Initialize empty state
-- `StreamDiffVSR_ExtractState` - Get previous HQ from state
-
----
-
-## Phase 4: Testing & Validation
-
-### 4.1 Unit Tests
-
-- [ ] `test_state.py` - State creation, serialization, clone
-- [ ] `test_pipeline.py` - Single frame, multi-frame, temporal consistency
-- [ ] `test_nodes.py` - Node input validation, output shapes
-
-### 4.2 Integration Testing Checklist
-
-- [ ] Single frame processing (no temporal guidance)
-- [ ] Multi-frame batch (temporal guidance active)
-- [ ] State continuity across chunks
-- [ ] VRAM usage at 720p, 1080p
-- [ ] Tiling with temporal consistency preserved
-- [ ] Different dtypes (fp16, bf16, fp32)
-- [ ] Error handling for missing models
-- [ ] Compatibility with VHS video loader
-
-### 4.3 Quality Validation
-
-- Compare output quality to upstream inference.py
-- Verify temporal consistency (smooth motion)
-- Check for tiling artifacts at boundaries
+Minor updates to match new pipeline API.
 
 ---
 
 ## Implementation Order
 
-### Step 1: Infrastructure (Day 1)
-1. Create directory structure
-2. Add LICENSE, NOTICE, requirements.txt, pyproject.toml
-3. Implement `compat.py` and `exceptions.py`
-4. Create empty `__init__.py` files
+### Day 1: Utilities & Infrastructure
+1. Update `requirements.txt` with correct deps
+2. Implement `flow_utils.py` with flow_warp
+3. Update `image_utils.py` with bicubic upscaling
+4. Delete `artg.py`, create `controlnet.py` (thin wrapper)
 
-### Step 2: Study Upstream (Day 1-2)
-1. Clone and study upstream repo
-2. Document answers to architecture questions
-3. Identify exact code to vendor/wrap
+### Day 2: Model Wrappers
+1. Update `unet.py` to wrap UNet2DConditionModel
+2. Create `temporal_vae.py` (vendor from upstream)
+3. Update `flow_estimator.py` for RAFT-Large
+4. Update `ddim.py` to use diffusers DDIMScheduler
 
-### Step 3: Utilities & State (Day 2)
-1. Implement `state.py`
-2. Implement `utils/image_utils.py`
-3. Implement `utils/flow_utils.py`
-4. Implement `utils/device_utils.py`
+### Day 3: Pipeline & Integration
+1. Rewrite `pipeline.py` with ControlNet flow
+2. Update `loader.py` for HuggingFace loading
+3. Update loader_node.py
+4. Test basic loading
 
-### Step 4: Models (Day 3-4)
-1. Implement `models/loader.py`
-2. Implement `models/flow_estimator.py`
-3. Implement `models/artg.py`
-4. Implement `models/unet.py`
-5. Implement `models/temporal_decoder.py`
-
-### Step 5: Pipeline (Day 4-5)
-1. Implement `schedulers/ddim_4step.py`
-2. Implement `pipeline.py`
-3. Test pipeline standalone (without ComfyUI)
-
-### Step 6: Nodes (Day 5-6)
-1. Implement loader node
-2. Implement upscale node
-3. Implement advanced nodes
-4. Wire up `__init__.py` registration
-
-### Step 7: Testing (Day 6-7)
-1. Unit tests
-2. Integration testing with ComfyUI
-3. Quality comparison to upstream
-
-### Step 8: Polish (Day 7+)
-1. README documentation
-2. Example workflows
-3. Error message improvements
-4. Optional: Tiling support
+### Day 4: Testing & Validation
+1. Single frame test
+2. Multi-frame temporal consistency test
+3. VRAM usage validation
+4. Compare output to upstream inference.py
 
 ---
 
-## Critical Pitfalls to Avoid
+## Verification Plan
 
-| Mistake | Correct Approach |
-|---------|------------------|
-| Hardcoded VAE scaling 0.18215 | Use `vae.config.scaling_factor` |
-| State tensors as Python lists | Use safetensors for serialization |
-| Naive spatial tiling | Flow/warp on full frame, tile only diffusion |
-| Using ComfyUI's KSampler | Self-contained pipeline owns denoising loop |
-| Claiming MIT license | Use Apache-2.0, include NOTICE file |
-| BHWC tensors in state | BCHW format, convert at I/O boundaries |
+### Automated Tests
+
+```bash
+# Test imports
+python -c "from stream_diffvsr.pipeline import StreamDiffVSRPipeline"
+
+# Test model loading
+python -c "
+from stream_diffvsr.models.loader import load_pipeline
+pipe = load_pipeline()
+print('Pipeline loaded successfully')
+"
+
+# Test single frame
+python -c "
+import torch
+from stream_diffvsr.models.loader import load_pipeline
+pipe = load_pipeline()
+test_input = torch.randn(1, 180, 320, 3)  # 180p test
+output, state = pipe(test_input)
+assert output.shape == (1, 720, 1280, 3), f'Wrong shape: {output.shape}'
+print('Single frame test passed')
+"
+```
+
+### Manual Verification
+
+1. Load workflow in ComfyUI
+2. Process test video (3-5 frames)
+3. Compare output quality to upstream
+4. Verify temporal consistency (no flickering)
 
 ---
 
-## Open Questions for Upstream Investigation
+## Risk Mitigation
 
-1. **VAE encode method:** `latent_dist.sample()` vs `.mode()`?
-2. **ARTG injection layers:** Which decoder blocks receive features?
-3. **Flow model:** RAFT-small? RAFT-large? Custom weights?
-4. **First frame handling:** Zero temporal features? Skip ARTG?
-5. **Scheduler sigmas:** What timestep schedule does 4-step use?
-6. **TPM in decoder:** How are multi-scale features fused?
+| Risk | Mitigation |
+|------|------------|
+| TemporalAutoencoderTiny not in diffusers | Vendor from upstream with minimal changes |
+| HuggingFace model format differs | Test loading early, adapt as needed |
+| VRAM usage higher than expected | Implement tiling as Phase 2 optimization |
+| diffusers version incompatibility | Pin versions in requirements.txt |
 
 ---
 

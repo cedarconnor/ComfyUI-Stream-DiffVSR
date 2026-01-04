@@ -1,8 +1,9 @@
 """
 Optical flow estimation for Stream-DiffVSR.
 
-Provides flow estimation between frames for temporal alignment.
-Supports RAFT and can reuse existing models from other ComfyUI nodes.
+Uses RAFT-Large from torchvision for high-quality optical flow estimation
+between consecutive frames. The flow is used to warp the previous HQ frame
+to align with the current frame for temporal guidance.
 """
 
 import torch
@@ -13,9 +14,116 @@ from typing import Optional, Tuple
 
 class FlowEstimator(nn.Module):
     """
-    Base class for optical flow estimation.
+    RAFT-Large optical flow estimator.
 
-    Estimates flow from previous frame to current frame.
+    Estimates optical flow between consecutive frames for temporal alignment.
+    The flow is computed on bicubic-upscaled 4x images (not LQ resolution).
+    """
+
+    def __init__(
+        self,
+        device: torch.device = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        """
+        Initialize RAFT-Large flow estimator.
+
+        Args:
+            device: Target device (default: cuda if available)
+            dtype: Model dtype (RAFT works best in float32)
+        """
+        super().__init__()
+        
+        self.device = device or torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        self.dtype = dtype
+
+        # Load RAFT-Large from torchvision
+        try:
+            from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+            self.model = raft_large(weights=Raft_Large_Weights.DEFAULT)
+            self.model = self.model.to(self.device).eval()
+            self.model.requires_grad_(False)
+        except ImportError:
+            raise ImportError(
+                "torchvision with optical flow support is required. "
+                "Install with: pip install torchvision>=0.15.0"
+            )
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        rescale_factor: int = 1,
+    ) -> torch.Tensor:
+        """
+        Estimate optical flow from source to target.
+
+        Args:
+            target: Target frame (B, C, H, W) - current frame
+            source: Source frame (B, C, H, W) - previous frame
+            rescale_factor: Optional downscale factor for flow computation
+
+        Returns:
+            Flow field (B, H, W, 2) in pixel coordinates
+            
+        Note:
+            Flow convention: flow[y, x] = (dx, dy) where
+            source[y + dy, x + dx] ≈ target[y, x]
+        """
+        # Ensure inputs are on correct device
+        target = target.to(self.device, self.dtype)
+        source = source.to(self.device, self.dtype)
+
+        # RAFT expects [0, 255] range, convert from [-1, 1] or [0, 1]
+        if target.min() < 0:
+            # [-1, 1] range
+            target_255 = ((target + 1) / 2 * 255).clamp(0, 255)
+            source_255 = ((source + 1) / 2 * 255).clamp(0, 255)
+        elif target.max() <= 1:
+            # [0, 1] range
+            target_255 = (target * 255).clamp(0, 255)
+            source_255 = (source * 255).clamp(0, 255)
+        else:
+            # Already in [0, 255]
+            target_255 = target
+            source_255 = source
+
+        # Compute flow (returns list of flow predictions, use last one)
+        flows = self.model(target_255, source_255)
+        flow = flows[-1]  # Best prediction
+
+        # Optionally rescale flow
+        if rescale_factor != 1:
+            flow = F.interpolate(
+                flow // rescale_factor,
+                scale_factor=1 / rescale_factor,
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        # Convert to (B, H, W, 2) format
+        flow = flow.permute(0, 2, 3, 1)
+
+        return flow
+
+    def to(self, device=None, dtype=None, *args, **kwargs):
+        """Move model to device."""
+        if device is not None:
+            self.device = device
+            self.model = self.model.to(device)
+        if dtype is not None:
+            self.dtype = dtype
+        return self
+
+
+class ZeroFlowEstimator(nn.Module):
+    """
+    Dummy flow estimator that returns zero flow.
+
+    Used when optical flow estimation is disabled or as fallback.
     """
 
     def __init__(self):
@@ -23,191 +131,75 @@ class FlowEstimator(nn.Module):
 
     def forward(
         self,
-        prev_frame: torch.Tensor,
-        curr_frame: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Estimate optical flow.
-
-        Args:
-            prev_frame: Previous frame (B, C, H, W), normalized to [0, 1]
-            curr_frame: Current frame (B, C, H, W), normalized to [0, 1]
-
-        Returns:
-            Flow field (B, 2, H, W) where:
-                flow[:, 0] = horizontal displacement (x)
-                flow[:, 1] = vertical displacement (y)
-        """
-        raise NotImplementedError
-
-
-class RAFTFlowEstimator(FlowEstimator):
-    """
-    RAFT-based optical flow estimator.
-
-    Uses RAFT (Recurrent All-Pairs Field Transforms) for accurate
-    optical flow estimation.
-    """
-
-    def __init__(
-        self,
-        model_path: Optional[str] = None,
-        device: torch.device = torch.device("cpu"),
-        dtype: torch.dtype = torch.float32,
-        num_iterations: int = 12,
-    ):
-        """
-        Initialize RAFT flow estimator.
-
-        Args:
-            model_path: Path to RAFT weights (optional, uses torchvision if None)
-            device: Target device
-            dtype: Data type
-            num_iterations: Number of RAFT iterations (more = better, slower)
-        """
-        super().__init__()
-        self.device = device
-        self.dtype = dtype
-        self.num_iterations = num_iterations
-        self._model = None
-        self._model_path = model_path
-
-    def _load_model(self):
-        """Lazy load the RAFT model."""
-        if self._model is not None:
-            return
-
-        try:
-            # Try torchvision RAFT first (simpler, no extra dependencies)
-            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
-
-            self._model = raft_small(weights=Raft_Small_Weights.DEFAULT)
-            self._model = self._model.to(self.device)
-            self._model.eval()
-            self._use_torchvision = True
-            print("[Stream-DiffVSR] Using torchvision RAFT-small for optical flow")
-
-        except ImportError:
-            # Fall back to loading from weights file
-            if self._model_path:
-                # TODO: Load RAFT from weights file
-                raise NotImplementedError(
-                    "Custom RAFT weights loading not yet implemented. "
-                    "Please install torchvision>=0.14.0 for RAFT support."
-                )
-            else:
-                raise ImportError(
-                    "Optical flow requires torchvision>=0.14.0 with RAFT support. "
-                    "Install with: pip install torchvision>=0.14.0"
-                )
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        prev_frame: torch.Tensor,
-        curr_frame: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Estimate optical flow using RAFT.
-
-        Args:
-            prev_frame: Previous frame (B, C, H, W), [0, 1] range
-            curr_frame: Current frame (B, C, H, W), [0, 1] range
-
-        Returns:
-            Flow field (B, 2, H, W)
-        """
-        self._load_model()
-
-        # Convert to expected format for torchvision RAFT
-        # RAFT expects uint8 or float in [0, 255] range
-        prev = (prev_frame * 255.0).to(self.device)
-        curr = (curr_frame * 255.0).to(self.device)
-
-        # Ensure float32 for RAFT
-        prev = prev.float()
-        curr = curr.float()
-
-        # Run RAFT
-        flow_predictions = self._model(prev, curr)
-
-        # Return the final flow prediction
-        # torchvision RAFT returns list of flows at different iterations
-        return flow_predictions[-1]
-
-
-class ZeroFlowEstimator(FlowEstimator):
-    """
-    Dummy flow estimator that returns zero flow.
-
-    Used when optical flow is disabled or unavailable.
-    Results in no temporal alignment (each frame processed independently).
-    """
-
-    def forward(
-        self,
-        prev_frame: torch.Tensor,
-        curr_frame: torch.Tensor,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        rescale_factor: int = 1,
     ) -> torch.Tensor:
         """Return zero flow field."""
-        B, C, H, W = curr_frame.shape
-        return torch.zeros(B, 2, H, W, device=curr_frame.device, dtype=curr_frame.dtype)
+        B, C, H, W = target.shape
+        return torch.zeros(B, H, W, 2, device=target.device, dtype=target.dtype)
+
+    def to(self, *args, **kwargs):
+        """No-op for compatibility."""
+        return self
+
+
+def compute_flows(
+    flow_estimator: FlowEstimator,
+    images: list,
+    rescale_factor: int = 1,
+) -> list:
+    """
+    Compute forward optical flows for a sequence of images.
+
+    Args:
+        flow_estimator: FlowEstimator instance
+        images: List of image tensors (B, C, H, W)
+        rescale_factor: Optional downscale factor
+
+    Returns:
+        List of flow tensors, one for each consecutive pair
+        flows[i] warps images[i] to images[i+1]
+    """
+    print('[Stream-DiffVSR] Computing optical flows...')
+    
+    forward_flows = []
+    for i in range(1, len(images)):
+        prev_image = images[i - 1]
+        cur_image = images[i]
+        flow = flow_estimator(cur_image, prev_image, rescale_factor=rescale_factor)
+        forward_flows.append(flow)
+    
+    return forward_flows
 
 
 def get_flow_estimator(
-    device: torch.device,
-    dtype: torch.dtype,
-    model_path: Optional[str] = None,
-    reuse_existing: bool = True,
+    device: torch.device = None,
+    dtype: torch.dtype = torch.float32,
+    use_raft: bool = True,
 ) -> FlowEstimator:
     """
-    Get optical flow estimator, reusing existing models if available.
+    Get optical flow estimator.
 
-    Checks for:
-    1. ComfyUI-Frame-Interpolation's loaded RAFT
-    2. ComfyUI-RAFT node's model
-    3. Falls back to bundled/torchvision RAFT
+    First checks if RAFT is available from torchvision.
+    Falls back to ZeroFlowEstimator if not available.
 
     Args:
         device: Target device
-        dtype: Data type
-        model_path: Optional path to RAFT weights
-        reuse_existing: Whether to try reusing existing models
+        dtype: Model dtype (RAFT works best in float32)
+        use_raft: Whether to use RAFT (if False, returns ZeroFlowEstimator)
 
     Returns:
-        Flow estimator instance
+        FlowEstimator or ZeroFlowEstimator instance
     """
-    if reuse_existing:
-        # Try to find existing RAFT from other nodes
-        try:
-            # Check ComfyUI-Frame-Interpolation
-            import ComfyUI_Frame_Interpolation
+    if not use_raft:
+        print("[Stream-DiffVSR] Flow estimation disabled")
+        return ZeroFlowEstimator()
 
-            if hasattr(ComfyUI_Frame_Interpolation, "get_raft_model"):
-                raft = ComfyUI_Frame_Interpolation.get_raft_model()
-                if raft is not None:
-                    print("[Stream-DiffVSR] Reusing RAFT from ComfyUI-Frame-Interpolation")
-                    # TODO: Wrap external RAFT
-        except ImportError:
-            pass
-
-        try:
-            # Check ComfyUI-RAFT
-            from ComfyUI_RAFT import raft_model
-
-            if raft_model is not None:
-                print("[Stream-DiffVSR] Reusing RAFT from ComfyUI-RAFT")
-                # TODO: Wrap external RAFT
-        except ImportError:
-            pass
-
-    # Fall back to our own RAFT
     try:
-        return RAFTFlowEstimator(
-            model_path=model_path,
-            device=device,
-            dtype=dtype,
-        )
+        estimator = FlowEstimator(device=device, dtype=dtype)
+        print("[Stream-DiffVSR] Using RAFT-Large for optical flow")
+        return estimator
     except ImportError as e:
         print(f"[Stream-DiffVSR] RAFT not available: {e}")
         print("[Stream-DiffVSR] Falling back to zero flow (no temporal guidance)")

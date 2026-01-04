@@ -16,7 +16,7 @@ class StreamDiffVSR_Upscale:
     Processes a batch of frames with auto-regressive temporal guidance.
     The batch dimension is treated as time - frames are processed
     sequentially with each frame using the previous frame's HQ output
-    for temporal conditioning.
+    for temporal conditioning via ControlNet.
     """
 
     @classmethod
@@ -68,6 +68,26 @@ class StreamDiffVSR_Upscale:
                         "tooltip": "Random seed for reproducibility",
                     },
                 ),
+                "guidance_scale": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 20.0,
+                        "step": 0.5,
+                        "tooltip": "CFG scale. 0 = disabled (default, as per upstream).",
+                    },
+                ),
+                "controlnet_scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.1,
+                        "tooltip": "ControlNet conditioning strength for temporal guidance.",
+                    },
+                ),
                 "enable_tiling": (
                     "BOOLEAN",
                     {
@@ -111,6 +131,8 @@ class StreamDiffVSR_Upscale:
         state: Optional[StreamDiffVSRState] = None,
         num_inference_steps: int = 4,
         seed: int = 0,
+        guidance_scale: float = 0.0,
+        controlnet_scale: float = 1.0,
         enable_tiling: bool = False,
         tile_size: int = 512,
         tile_overlap: int = 64,
@@ -124,6 +146,8 @@ class StreamDiffVSR_Upscale:
             state: Optional previous state
             num_inference_steps: Denoising steps
             seed: Random seed
+            guidance_scale: CFG scale (0 = disabled)
+            controlnet_scale: ControlNet conditioning strength
             enable_tiling: Whether to use tiling
             tile_size: Tile size
             tile_overlap: Tile overlap
@@ -150,6 +174,8 @@ class StreamDiffVSR_Upscale:
             state=state,
             num_inference_steps=num_inference_steps,
             seed=seed,
+            guidance_scale=guidance_scale,
+            controlnet_conditioning_scale=controlnet_scale,
             progress_callback=progress,
         )
 

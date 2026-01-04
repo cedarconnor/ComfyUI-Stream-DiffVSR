@@ -6,7 +6,7 @@ Provides image warping using flow fields for temporal alignment.
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, Union
 
 
 def create_meshgrid(
@@ -33,6 +33,67 @@ def create_meshgrid(
     return grid_x, grid_y
 
 
+def flow_warp(
+    x: torch.Tensor,
+    flow: torch.Tensor,
+    interp_mode: str = "bilinear",
+    padding_mode: str = "zeros",
+) -> torch.Tensor:
+    """
+    Warp an image or feature map with optical flow.
+    
+    This is the upstream implementation from Stream-DiffVSR.
+    Handles both (B, 2, H, W) and (B, H, W, 2) flow formats.
+
+    Args:
+        x: Input tensor (B, C, H, W)
+        flow: Flow field (B, 2, H, W) or (B, H, W, 2)
+              Flow convention: flow[y, x] = (dx, dy)
+        interp_mode: 'nearest' or 'bilinear'
+        padding_mode: 'zeros', 'border', or 'reflection'
+
+    Returns:
+        Warped tensor (B, C, H, W)
+    """
+    # Handle flow format
+    if flow.dim() == 4 and flow.shape[1] == 2:
+        # (B, 2, H, W) -> (B, H, W, 2)
+        flow = flow.permute(0, 2, 3, 1)
+
+    assert x.size()[-2:] == flow.size()[1:3], \
+        f"Image size {x.size()[-2:]} doesn't match flow size {flow.size()[1:3]}"
+    
+    _, _, H, W = x.size()
+    
+    # Create mesh grid
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(0, H, device=x.device, dtype=x.dtype),
+        torch.arange(0, W, device=x.device, dtype=x.dtype),
+        indexing="ij"
+    )
+    grid = torch.stack((grid_x, grid_y), dim=2)  # (H, W, 2)
+    grid = grid.unsqueeze(0).expand(flow.shape[0], -1, -1, -1)  # (B, H, W, 2)
+    
+    # Add flow to grid
+    vgrid = grid + flow
+    
+    # Normalize to [-1, 1] for grid_sample
+    vgrid_x = 2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0
+    vgrid_y = 2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0
+    vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
+    
+    # Sample
+    output = F.grid_sample(
+        x,
+        vgrid_scaled,
+        mode=interp_mode,
+        padding_mode=padding_mode,
+        align_corners=False,
+    )
+    
+    return output
+
+
 def warp_image(
     image: torch.Tensor,
     flow: torch.Tensor,
@@ -56,47 +117,7 @@ def warp_image(
     Returns:
         Warped image (B, C, H, W)
     """
-    B, C, H, W = image.shape
-    _, flow_channels, flow_H, flow_W = flow.shape
-
-    if flow_channels != 2:
-        raise ValueError(f"Flow must have 2 channels, got {flow_channels}")
-
-    # Resize flow if dimensions don't match
-    if flow_H != H or flow_W != W:
-        flow = F.interpolate(flow, size=(H, W), mode="bilinear", align_corners=False)
-        # Scale flow values proportionally
-        flow = flow * torch.tensor(
-            [W / flow_W, H / flow_H],
-            device=flow.device,
-            dtype=flow.dtype,
-        ).view(1, 2, 1, 1)
-
-    # Create sampling grid
-    grid_x, grid_y = create_meshgrid(H, W, image.device, image.dtype)
-
-    # Add flow to grid coordinates
-    # flow[:, 0] is horizontal (x), flow[:, 1] is vertical (y)
-    sample_x = grid_x.unsqueeze(0) + flow[:, 0]
-    sample_y = grid_y.unsqueeze(0) + flow[:, 1]
-
-    # Normalize to [-1, 1] for grid_sample
-    sample_x = 2.0 * sample_x / (W - 1) - 1.0
-    sample_y = 2.0 * sample_y / (H - 1) - 1.0
-
-    # Stack into grid format (B, H, W, 2)
-    grid = torch.stack([sample_x, sample_y], dim=-1)
-
-    # Warp image
-    warped = F.grid_sample(
-        image,
-        grid,
-        mode=mode,
-        padding_mode=padding_mode,
-        align_corners=True,
-    )
-
-    return warped
+    return flow_warp(image, flow, interp_mode=mode, padding_mode=padding_mode)
 
 
 def upscale_flow(
@@ -108,22 +129,33 @@ def upscale_flow(
     Upscale flow field and adjust values for new resolution.
 
     Args:
-        flow: Flow field (B, 2, H, W)
+        flow: Flow field (B, 2, H, W) or (B, H, W, 2)
         scale_factor: Upscale factor (e.g., 4 for 4x upscaling)
         mode: Interpolation mode
 
     Returns:
-        Upscaled flow (B, 2, H*scale, W*scale)
+        Upscaled flow in same format as input
     """
-    upscaled = F.interpolate(
-        flow,
-        scale_factor=scale_factor,
-        mode=mode,
-        align_corners=False,
-    )
-    # Scale flow values by the same factor
-    upscaled = upscaled * scale_factor
-    return upscaled
+    # Handle (B, H, W, 2) format
+    if flow.dim() == 4 and flow.shape[-1] == 2:
+        flow_bchw = flow.permute(0, 3, 1, 2)  # (B, H, W, 2) -> (B, 2, H, W)
+        upscaled = F.interpolate(
+            flow_bchw,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=False,
+        )
+        upscaled = upscaled * scale_factor
+        return upscaled.permute(0, 2, 3, 1)  # Back to (B, H, W, 2)
+    else:
+        upscaled = F.interpolate(
+            flow,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=False,
+        )
+        upscaled = upscaled * scale_factor
+        return upscaled
 
 
 def compute_occlusion_mask(
