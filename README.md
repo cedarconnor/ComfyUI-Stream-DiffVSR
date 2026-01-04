@@ -2,6 +2,8 @@
 
 ComfyUI custom nodes for **Stream-DiffVSR** video super-resolution with temporal consistency.
 
+![Stream-DiffVSR](https://img.shields.io/badge/Stream--DiffVSR-v1-blue) ![License](https://img.shields.io/badge/License-Apache%202.0-green)
+
 ## Features
 
 - **4x Video Upscaling** - High-quality 4x super-resolution using diffusion
@@ -12,7 +14,9 @@ ComfyUI custom nodes for **Stream-DiffVSR** video super-resolution with temporal
 
 ## Installation
 
-### 1. Install custom nodes:
+### 1. Install custom nodes
+Navigate to your ComfyUI custom nodes directory and clone this repository:
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/cedarconnor/ComfyUI-Stream-DiffVSR
@@ -20,11 +24,12 @@ cd ComfyUI-Stream-DiffVSR
 pip install -r requirements.txt
 ```
 
-### 2. Download models (Choose one option):
+### 2. Download models
+You have two options for model setup:
 
-**Option A: Manual Download (Preferred)**
+**Option A: Manual Download (Recommended)**
+Download the model files from [Jamichsu/Stream-DiffVSR](https://huggingface.co/Jamichsu/Stream-DiffVSR) and verify the structure matches exactly:
 
-Download from [Jamichsu/Stream-DiffVSR](https://huggingface.co/Jamichsu/Stream-DiffVSR) and place in:
 ```
 ComfyUI/models/StreamDiffVSR/v1/
 ├── controlnet/
@@ -33,120 +38,95 @@ ComfyUI/models/StreamDiffVSR/v1/
 └── scheduler/
 ```
 
-**Option B: Auto-Download (Fallback)**
-
-If local models are not found, they will be automatically downloaded from HuggingFace on first use. Models are cached in `~/.cache/huggingface/`.
+**Option B: Auto-Download**
+If you skip manual download, the nodes will automatically download models from HuggingFace to your cache (`~/.cache/huggingface/`) upon first run. This requires internet access.
 
 ### 3. Restart ComfyUI
+Restart your ComfyUI server to load the new nodes.
 
-## Nodes
+## Nodes Reference
 
-### StreamDiffVSR_Loader
-Load all model components from HuggingFace. Returns a pipeline object for inference.
+### 1. StreamDiffVSR_Loader
+Initializes the model pipeline.
 
-- **model_version**: Model version (default: v1)
-- **device**: cuda / cpu / auto
-- **dtype**: float16 / bfloat16 / float32
+- **model_version**: Select model version (default: `v1`).
+- **device**: Compute device (`cuda`, `cpu`, or `auto`).
+- **dtype**: Precision (`float16` for GPUs, `float32` for CPU).
+    - *Tip*: Use `float16` to save VRAM on supported GPUs.
+- **use_local_models**: Attempt to load from `ComfyUI/models/StreamDiffVSR/` first.
+- **use_huggingface**: Download from HuggingFace if local load fails.
 
-### StreamDiffVSR_Upscale
-Main upscaling node. Processes batches of frames with temporal guidance.
+### 2. StreamDiffVSR_Upscale
+The main node for processing video frames.
 
-- **pipe**: Pipeline from loader
-- **images**: Input frames (batch = frame sequence)
-- **state**: (optional) Previous state for continuation
-- **num_inference_steps**: Denoising steps (default: 4)
-- **seed**: Random seed
+**Inputs:**
+- **pipe**: Connection from `StreamDiffVSR_Loader`.
+- **images**: Batch of frames to upscale (BHWC format).
+- **state**: (Optional) Connection from a previous `StreamDiffVSR_Upscale` or `StreamDiffVSR_CreateState` node. Required for temporal continuity between chunks.
 
-### StreamDiffVSR_ProcessFrame (Advanced)
-Process single frames with explicit state I/O. For custom loops.
+**Parameters:**
+- **num_inference_steps**: Denoising steps (default: `4`).
+- **seed**: Seed for noise generation.
+- **guidance_scale**: CFG scale. default `0.0` (disabled) is recommended for this model.
+- **controlnet_scale**: Strength of temporal guidance (default: `1.0`). Lower values reduce consistency but may increase sharpness.
+- **enable_tiling**: (Experimental) Enable to reduce VRAM usage for high-res inputs.
+- **tile_size**: Size of tiles (default: `512`).
+- **tile_overlap**: Pixels of overlap between tiles (default: `64`).
 
-### StreamDiffVSR_CreateState (Advanced)
-Create empty state or pre-populate for seamless continuation.
+### 3. State Management (Advanced)
+Nodes for handling long-video processing where you need to break the video into batches.
 
-### StreamDiffVSR_ExtractState (Advanced)
-Extract previous frame and metadata from state.
+**StreamDiffVSR_CreateState**
+Creates a new state object.
+- **initial_frame/initial_lq_frame**: Optionally pre-populate state to continue from a specific frame (e.g. from a separate workflow).
 
-## Usage
+**StreamDiffVSR_ExtractState**
+- Extracts the `previous_hq` and `previous_lq_upscaled` frames from a state object for inspection or saving.
+
+## Workflows
 
 ### Basic Workflow
-```
-[Load Video] → [StreamDiffVSR_Loader] → [StreamDiffVSR_Upscale] → [Save Video]
-                      ↓
-               [Pipeline]
-```
+For short videos that fit in VRAM (e.g., < 24 frames at 1080p output).
 
-### Processing Long Videos
-For videos that don't fit in VRAM, process in chunks:
+1. **Load Video** -> **StreamDiffVSR_Upscale** (images input)
+2. **StreamDiffVSR_Loader** -> **StreamDiffVSR_Upscale** (pipe input)
+3. **StreamDiffVSR_Upscale** (images output) -> **Save Video**
 
-1. First chunk: No state input
-2. Subsequent chunks: Connect state output → state input
+### Long Video Workflow (Chunked)
+To process long videos without OOM errors, process in batches.
 
-This maintains temporal consistency across chunk boundaries.
+1. **Batch 1**:
+    - **Load Video (Frames 0-15)** -> `Upscale Node 1`
+    - `Upscale Node 1` (state output) -> Connect to next node...
 
-## VRAM Requirements
+2. **Batch 2**:
+    - **Load Video (Frames 16-31)** -> `Upscale Node 2`
+    - Connect `Upscale Node 1` (state) -> `Upscale Node 2` (state input)
 
-| Resolution | Tiling | Estimated VRAM |
-|------------|--------|----------------|
-| 480p | Off | ~6 GB |
-| 720p | Off | ~10 GB |
-| 1080p | Off | ~18 GB |
-| 720p | 512px | ~6 GB |
+*Note: In ComfyUI, you typically use a loop or a custom script to handle this sequentially.*
+
+## VRAM Estimation
+
+| Input Resolution | Tiling | Est. VRAM |
+|------------------|--------|-----------|
+| 480p             | Off    | ~6 GB     |
+| 720p             | Off    | ~10 GB    |
+| 1080p            | Off    | ~18 GB    |
+| 720p             | 512px  | ~6 GB     |
 
 ## Technical Details
 
-Stream-DiffVSR uses:
-- **ControlNet** for temporal guidance (warped previous HQ frame)
-- **UNet2DConditionModel** from SD x4 Upscaler (distilled for 4-step)
-- **TemporalAutoencoderTiny** with TPM for temporal feature fusion
-- **RAFT-Large** optical flow for motion alignment
+Stream-DiffVSR uses a recurrent architecture:
+1. **RAFT Optical Flow**: Aligns the previous high-quality (HQ) output to the current frame.
+2. **ControlNet**: Uses the warped previous HQ frame as a condition to guide the diffusion process for the current frame.
+3. **TPM VAE**: A temporal VAE fuses features from the previous timestep to decode the final image.
 
-The batch dimension represents frame order. Frame N uses frame N-1's
-upscaled output (warped by optical flow) for temporal guidance via ControlNet.
+## Troubleshooting
 
-### Architecture
-
-```
-LQ Frame (t) ──────────────────────────────────────────────────────┐
-     │                                                              │
-     ├── Bicubic 4x ──── Optical Flow ◄──── Previous HQ (t-1)      │
-     │                        │                     │               │
-     │                        ▼                     │               │
-     │                   Flow Warp ─────────────────┘               │
-     │                        │                                     │
-     │                        ▼                                     │
-     │              Warped Previous HQ                              │
-     │                   │         │                                │
-     │                   │         ├── VAE Encode ──► TPM Features  │
-     │                   │         │                       │        │
-     │                   ▼         ▼                       │        │
-     │              ControlNet ──► U-Net ◄─────────────────┘        │
-     │                              │                               │
-     │                              ▼                               │
-     │                      Denoised Latents                        │
-     │                              │                               │
-     └────────────────────────────► VAE Decode (with TPM) ──► HQ Frame (t)
-                                                                    │
-                                               Store for t+1 ◄──────┘
-```
+- **Out of Memory (OOM)**: Be sure `enable_tiling` is checked if you are hitting limits, or reduce batch size.
+- **Missing Dependencies**: Ensure `torchvision` is installed for RAFT optical flow support.
+- **Flickering**: Ensure `state` is correctly passed between batches. If `state` is disconnected, each batch starts fresh without temporal knowledge.
 
 ## License
 
-Apache-2.0 (matching upstream Stream-DiffVSR)
-
-## Credits
-
-- **Stream-DiffVSR**: [jamichss/Stream-DiffVSR](https://github.com/jamichss/Stream-DiffVSR)
-- **HuggingFace Model**: [Jamichsu/Stream-DiffVSR](https://huggingface.co/Jamichsu/Stream-DiffVSR)
-- **ComfyUI Integration**: Cedar
-
-## Status
-
-⚠️ **Development**: Model wrappers are being implemented based on upstream architecture.
-
-Current progress:
-- [x] Project structure and ComfyUI integration
-- [x] Documentation and planning
-- [ ] ControlNet temporal guidance implementation
-- [ ] Temporal VAE with TPM
-- [ ] Full pipeline integration
-- [ ] Testing and validation
+Apache-2.0

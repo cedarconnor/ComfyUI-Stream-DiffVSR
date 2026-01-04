@@ -53,6 +53,7 @@ class StreamDiffVSR_ProcessFrame:
                         "min": 1,
                         "max": 50,
                         "step": 1,
+                        "tooltip": "Denoising steps (default: 4)",
                     },
                 ),
                 "seed": (
@@ -61,6 +62,7 @@ class StreamDiffVSR_ProcessFrame:
                         "default": 0,
                         "min": 0,
                         "max": 0xFFFFFFFFFFFFFFFF,
+                        "tooltip": "Random seed for reproducibility",
                     },
                 ),
             },
