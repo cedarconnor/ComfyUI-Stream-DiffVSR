@@ -447,25 +447,45 @@ class StreamDiffVSRPipeline:
             state = StreamDiffVSRState()
 
         # Pre-compute all LQ upscaled images and flows
-        # (Flow must be computed on upscaled images, not LQ resolution)
         print('[Stream-DiffVSR] Preparing frames...')
-        lq_upscaled_list = []
+        lq_list = []  # Original LQ frames (for fast flow)
+        lq_upscaled_list = []  # Upscaled LQ frames
         for i in range(num_frames):
             frame = images[i:i+1]
             lq_bchw = bhwc_to_bchw(frame).to(self.device, self.dtype)
+            lq_list.append(lq_bchw)
             lq_upscaled = F.interpolate(
                 lq_bchw, scale_factor=scale, mode='bicubic', align_corners=False
             )
             lq_upscaled_list.append(lq_upscaled)
 
-        # Include previous frame's upscaled LQ for flow computation
-        if state.has_previous:
-            all_upscaled = [state.previous_lq_upscaled.to(self.device, self.dtype)] + lq_upscaled_list
-        else:
-            all_upscaled = lq_upscaled_list
-
         # Compute flows
-        flows = self.compute_flows(all_upscaled)
+        print('[Stream-DiffVSR] Computing optical flows...')
+        if force_flow_on_lq:
+            # FAST: Compute flow on original LQ resolution, then upscale
+            if state.has_previous:
+                # Downsample previous upscaled LQ to original resolution
+                prev_lq = F.interpolate(
+                    state.previous_lq_upscaled.to(self.device, self.dtype),
+                    scale_factor=1/scale, mode='bilinear'
+                )
+                all_lq = [prev_lq] + lq_list
+            else:
+                all_lq = lq_list
+            
+            flows_lq = self.compute_flows(all_lq)
+            
+            # Upscale flows to HQ resolution
+            from .utils.flow_utils import upscale_flow
+            flows = [upscale_flow(f, scale_factor=scale) for f in flows_lq]
+        else:
+            # STANDARD: Compute flow on upscaled images (uses more VRAM)
+            if state.has_previous:
+                all_upscaled = [state.previous_lq_upscaled.to(self.device, self.dtype)] + lq_upscaled_list
+            else:
+                all_upscaled = lq_upscaled_list
+            
+            flows = self.compute_flows(all_upscaled)
 
         # Process frames
         hq_frames = []
