@@ -28,7 +28,7 @@ class StreamDiffVSRConfig:
 
     scale_factor: int = 4
     latent_channels: int = 4
-    latent_scale: int = 8  # Spatial downscale in latent space (VAE)
+    latent_scale: int = 4  # Spatial downscale in latent space (TemporalAutoencoderTiny uses 4x)
     num_inference_steps: int = 4
     vae_scaling_factor: float = 1.0  # AutoEncoderTiny uses 1.0
     guidance_scale: float = 0.0  # No CFG by default (as per upstream)
@@ -303,8 +303,6 @@ class StreamDiffVSRPipeline:
                 dec_temporal_features = None
 
         # Prepare initial latents
-        # DEBUG: trace sizes
-        print(f"[DEBUG] lq_frame.shape: {lq_frame.shape}, target: {target_h}x{target_w}, lq_upscaled: {lq_upscaled.shape}")
         latents = self._prepare_latents(B, target_h, target_w, generator)
 
         # Get prompt embeddings (empty for unconditional)
@@ -343,9 +341,7 @@ class StreamDiffVSRPipeline:
             unet_in_channels = getattr(self.unet.config, 'in_channels', 4)
             if unet_in_channels > self.config.latent_channels:
                 # Encode LQ to latent space for concatenation
-                print(f"[DEBUG] Before VAE encode - lq_upscaled_normalized.shape: {lq_upscaled_normalized.shape}")
                 lq_latent = self.vae.encode(lq_upscaled_normalized)
-                print(f"[DEBUG] After VAE encode - lq_latent.shape: {lq_latent.shape}")
                 if do_cfg:
                     lq_latent = torch.cat([lq_latent] * 2)
                 latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)

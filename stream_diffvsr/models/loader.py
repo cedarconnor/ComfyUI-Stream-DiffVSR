@@ -286,7 +286,7 @@ class ModelLoader:
         return {
             "scale_factor": 4,
             "latent_channels": 4,
-            "latent_scale": 8,
+            "latent_scale": 4,
             "num_inference_steps": 4,
             "vae_scaling_factor": 1.0,  # AutoEncoderTiny uses 1.0
         }
@@ -407,7 +407,7 @@ def load_pipeline(
     config = StreamDiffVSRConfig(
         scale_factor=4,
         latent_channels=4,
-        latent_scale=8,
+        latent_scale=4,
         num_inference_steps=4,
         vae_scaling_factor=1.0,
     )
