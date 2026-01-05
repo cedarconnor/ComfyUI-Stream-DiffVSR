@@ -39,7 +39,17 @@ class TemporalControlNet(nn.Module):
         """
         super().__init__()
         self.controlnet = controlnet
-        self.config = config or {}
+        self._custom_config = config or {}
+    
+    @property
+    def config(self):
+        """Expose underlying controlnet's config for introspection."""
+        return getattr(self.controlnet, 'config', self._custom_config)
+    
+    @property
+    def conv_in(self):
+        """Expose underlying controlnet's conv_in for channel introspection."""
+        return getattr(self.controlnet, 'conv_in', None)
 
     def forward(
         self,

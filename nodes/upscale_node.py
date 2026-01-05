@@ -98,6 +98,16 @@ class StreamDiffVSR_Upscale:
                         ),
                     },
                 ),
+                "disable_tpm": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Disable Temporal Processor Modules in VAE decoder. "
+                            "Use for debugging or frame-by-frame upscaling."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -117,6 +127,7 @@ class StreamDiffVSR_Upscale:
         guidance_scale: float = 0.0,
         controlnet_scale: float = 1.0,
         force_flow_on_lq: bool = False,
+        disable_tpm: bool = False,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
         Upscale video frames.
@@ -151,6 +162,7 @@ class StreamDiffVSR_Upscale:
             guidance_scale=guidance_scale,
             controlnet_conditioning_scale=controlnet_scale,
             force_flow_on_lq=force_flow_on_lq,
+            disable_tpm=disable_tpm,
             progress_callback=progress,
         )
 

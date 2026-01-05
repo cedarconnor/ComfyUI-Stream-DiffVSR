@@ -28,7 +28,7 @@ class StreamDiffVSRConfig:
 
     scale_factor: int = 4
     latent_channels: int = 4
-    latent_scale: int = 4  # Spatial downscale in latent space (TemporalAutoencoderTiny uses 4x)
+    latent_scale: int = 8  # Spatial downscale in latent space - derived from VAE: 2^(len(block_out_channels)-1)
     num_inference_steps: int = 4
     vae_scaling_factor: float = 1.0  # AutoEncoderTiny uses 1.0
     guidance_scale: float = 0.0  # No CFG by default (as per upstream)
@@ -93,6 +93,25 @@ class StreamDiffVSRPipeline:
         # Default empty prompt embeddings (no text conditioning)
         self._empty_prompt_embeds = None
 
+        # Log model configuration for debugging
+        unet_in_ch = getattr(unet.config, 'in_channels', 'unknown')
+        unet_cross_attn = getattr(unet.config, 'cross_attention_dim', 'unknown')
+        cn_in_ch = getattr(controlnet.config, 'in_channels', 'unknown')
+        # Check actual ControlNet conv_in layer
+        if hasattr(controlnet, 'conv_in'):
+            cn_actual_in_ch = controlnet.conv_in.in_channels
+        else:
+            cn_actual_in_ch = 'no conv_in'
+        print(f"[Stream-DiffVSR] UNet in_channels: {unet_in_ch}, cross_attention_dim: {unet_cross_attn}")
+        print(f"[Stream-DiffVSR] ControlNet in_channels (config): {cn_in_ch}, (actual conv_in): {cn_actual_in_ch}")
+        print(f"[Stream-DiffVSR] Text encoder: {'loaded' if text_encoder is not None else 'NOT loaded'}")
+
+        # Log scheduler configuration
+        if scheduler is not None:
+            sched_cfg = getattr(scheduler, 'config', {})
+            print(f"[Stream-DiffVSR] Scheduler: {scheduler.__class__.__name__}")
+            print(f"[Stream-DiffVSR] Scheduler timesteps: {getattr(sched_cfg, 'num_train_timesteps', 'unknown')}")
+
     def to(self, device=None, dtype=None):
         """Move pipeline to device/dtype."""
         if device is not None:
@@ -116,11 +135,12 @@ class StreamDiffVSRPipeline:
             if embeds.shape[0] != batch_size:
                 embeds = embeds.repeat(batch_size, 1, 1)
             return embeds.to(self.device, self.dtype)
-        
+
         # Create empty prompt embeddings
         # SD x4 Upscaler expects encoder_hidden_states
         if self.text_encoder is not None and self.tokenizer is not None:
-            # Use actual text encoder
+            # Use actual text encoder for proper CLIP embeddings
+            print("[Stream-DiffVSR] Using CLIP text encoder for prompt embeddings")
             text_inputs = self.tokenizer(
                 [""],
                 padding="max_length",
@@ -131,15 +151,21 @@ class StreamDiffVSRPipeline:
                 text_embeds = self.text_encoder(
                     text_inputs.input_ids.to(self.device)
                 )[0]
-            self._empty_prompt_embeds = text_embeds
+            self._empty_prompt_embeds = text_embeds.to(self.dtype)
+            # Verify embeddings are non-zero (CLIP shouldn't produce zeros)
+            embed_norm = text_embeds.abs().mean().item()
+            print(f"[Stream-DiffVSR] Prompt embeddings shape: {text_embeds.shape}, mean abs: {embed_norm:.4f}")
+            if embed_norm < 0.01:
+                print("[Stream-DiffVSR] WARNING: Embeddings are near-zero, this is unexpected!")
         else:
-            # Create dummy embeddings (77 tokens, 1024 dim for SDXL-like)
-            # Actual dimension depends on the model
+            # Fallback: Create dummy embeddings (suboptimal - may cause splotchy artifacts)
+            print("[Stream-DiffVSR] WARNING: Using zero embeddings (no text encoder)")
+            print("[Stream-DiffVSR] This WILL cause splotchy artifacts! Text encoder must be loaded.")
             hidden_size = getattr(self.unet.config, 'cross_attention_dim', 1024)
             self._empty_prompt_embeds = torch.zeros(
                 1, 77, hidden_size, device=self.device, dtype=self.dtype
             )
-        
+
         return self._empty_prompt_embeds.repeat(batch_size, 1, 1).to(self.device, self.dtype)
 
     def _prepare_latents(
@@ -201,6 +227,7 @@ class StreamDiffVSRPipeline:
         guidance_scale: float = 0.0,
         controlnet_conditioning_scale: float = 1.0,
         force_flow_on_lq: bool = False,
+        disable_tpm: bool = False,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
         Process a single frame with ControlNet temporal guidance.
@@ -215,6 +242,7 @@ class StreamDiffVSRPipeline:
             guidance_scale: CFG scale (0 = no CFG, as per upstream)
             controlnet_conditioning_scale: ControlNet strength
             force_flow_on_lq: If True, compute flow on LQ frames (faster). If False, compute on HQ (better quality).
+            disable_tpm: If True, don't use temporal features in VAE decode (for debugging).
 
         Returns:
             hq_frame: High-quality output frame (1, H*4, W*4, C) BHWC
@@ -297,13 +325,26 @@ class StreamDiffVSRPipeline:
 
             # Extract temporal features for VAE decoder TPM
             enc_layer_features = self.vae.encode(warped_prev_hq, return_features_only=True)
-            if isinstance(enc_layer_features, list):
+            if isinstance(enc_layer_features, list) and len(enc_layer_features) > 0:
                 dec_temporal_features = enc_layer_features[::-1]  # Reverse for decoder order
+                # Debug: log feature shapes on frame 1
+                if state.frame_index == 0:
+                    shapes = [f.shape for f in dec_temporal_features]
+                    print(f"[Stream-DiffVSR] Frame 1: TPM features extracted: {len(dec_temporal_features)} layers")
+                    print(f"[Stream-DiffVSR] Frame 1: TPM feature shapes (reversed for decoder): {shapes}")
             else:
                 dec_temporal_features = None
+                if state.frame_index == 0:
+                    print(f"[Stream-DiffVSR] Frame 1: TPM feature extraction returned {type(enc_layer_features).__name__}")
 
         # Prepare initial latents
         latents = self._prepare_latents(B, target_h, target_w, generator)
+
+        # Validate latent dimensions
+        latent_h = target_h // self.config.latent_scale
+        latent_w = target_w // self.config.latent_scale
+        assert latents.shape[2] == latent_h and latents.shape[3] == latent_w, \
+            f"Latent size mismatch: got {latents.shape[2:]} expected ({latent_h}, {latent_w})"
 
         # Get prompt embeddings (empty for unconditional)
         prompt_embeds = self._get_prompt_embeds(B)
@@ -315,6 +356,10 @@ class StreamDiffVSRPipeline:
 
         # Setup scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+
+        # Log timesteps for first frame
+        if state.frame_index == 0:
+            print(f"[Stream-DiffVSR] Timesteps ({num_inference_steps} steps): {self.scheduler.timesteps.tolist()}")
         timesteps = self.scheduler.timesteps
 
         # Reset VAE temporal state
@@ -331,25 +376,36 @@ class StreamDiffVSRPipeline:
             
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             
-            # Concatenate LQ image to latents (SD x4 Upscaler style)
-            # The upscaled LQ provides structural guidance
-            lq_for_concat = lq_upscaled_normalized
-            if do_cfg:
-                lq_for_concat = torch.cat([lq_for_concat] * 2)
-            
-            # Check if U-Net expects concatenated input
+            # Check if U-Net expects concatenated input (SD x4 Upscaler style)
             unet_in_channels = getattr(self.unet.config, 'in_channels', 4)
             if unet_in_channels > self.config.latent_channels:
                 if unet_in_channels == 7:
-                    # Concatenate LQ image (pixel space) directly
-                    # Valid when latent_scale == scale_factor (both 4), so LQ size == Latent size
+                    # 7-channel UNet: concat pixel-space LQ image
+                    # With latent_scale=4 and scale_factor=4, LQ and latent have same spatial size
                     cond_input = lq_normalized
+                    # Log sizes on first timestep of first frame for debugging
+                    if i == 0 and state.frame_index == 0:
+                        print(f"[Stream-DiffVSR] LQ input size: {cond_input.shape[2:]} (HxW)")
+                        print(f"[Stream-DiffVSR] Latent size: {latent_model_input.shape[2:]} (HxW)")
+                        print(f"[Stream-DiffVSR] Config: latent_scale={self.config.latent_scale}, scale_factor={self.config.scale_factor}")
+                    # Verify sizes match (they should when latent_scale == scale_factor)
+                    if cond_input.shape[2:] != latent_model_input.shape[2:]:
+                        print(f"[Stream-DiffVSR] WARNING: Size mismatch! LQ {cond_input.shape[2:]} != Latent {latent_model_input.shape[2:]}")
+                        print("[Stream-DiffVSR] This indicates latent_scale != scale_factor, resizing LQ (quality loss!)")
+                        cond_input = F.interpolate(
+                            cond_input,
+                            size=latent_model_input.shape[2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
                     if do_cfg:
                         cond_input = torch.cat([cond_input] * 2)
                     latent_model_input = torch.cat([latent_model_input, cond_input], dim=1)
                 else:
-                    # Generic case (e.g. 8 channels): Encode LQ to latent space
+                    # 8-channel UNet: concat LQ encoded to latent space
                     lq_latent = self.vae.encode(lq_upscaled_normalized)
+                    if hasattr(lq_latent, 'latents'):
+                        lq_latent = lq_latent.latents
                     if do_cfg:
                         lq_latent = torch.cat([lq_latent] * 2)
                     latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)
@@ -393,11 +449,43 @@ class StreamDiffVSRPipeline:
             latents = step_output.prev_sample
 
         # ===== DECODE with Temporal Features =====
+        # ===== DECODE with Temporal Features =====
+
         # Decode latents with TPM temporal feature fusion
         scaling_factor = getattr(self.vae.config, 'scaling_factor', 1.0)
         latents_scaled = latents / scaling_factor
+
+        # Conditionally skip TPM if requested
+        decode_temporal_features = None if disable_tpm else dec_temporal_features
+        if disable_tpm and state.frame_index == 1:
+            print("[Stream-DiffVSR] TPM disabled - using frame-by-frame upscaling")
         
-        hq_bchw = self.vae.decode(latents_scaled, temporal_features=dec_temporal_features)
+        # Ensure no stale features from previous runs/frames
+        self.vae.reset_temporal_condition()
+
+        hq_bchw = self.vae.decode(latents_scaled, temporal_features=decode_temporal_features)
+        
+        # Clear temporal features immediately after use to prevent leakage
+        self.vae.reset_temporal_condition()
+
+        # Handle different return types from VAE decode
+        if hasattr(hq_bchw, 'sample'):
+            hq_bchw = hq_bchw.sample
+        elif isinstance(hq_bchw, tuple):
+            hq_bchw = hq_bchw[0]
+
+        # Validate output dimensions
+        expected_h, expected_w = target_h, target_w
+        actual_h, actual_w = hq_bchw.shape[2], hq_bchw.shape[3]
+        if actual_h != expected_h or actual_w != expected_w:
+            # Resize if VAE produced different size (shouldn't happen with correct latent_scale)
+            import warnings
+            warnings.warn(
+                f"VAE output size ({actual_h}x{actual_w}) differs from expected ({expected_h}x{expected_w}). "
+                f"This indicates latent_scale mismatch. Resizing output.",
+                UserWarning
+            )
+            hq_bchw = F.interpolate(hq_bchw, size=(expected_h, expected_w), mode='bilinear', align_corners=False)
         
         # Reset temporal state after decode
         if hasattr(self.vae, 'reset_temporal_condition'):
@@ -431,6 +519,7 @@ class StreamDiffVSRPipeline:
         guidance_scale: float = 0.0,
         controlnet_conditioning_scale: float = 1.0,
         force_flow_on_lq: bool = False,
+        disable_tpm: bool = False,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
@@ -529,6 +618,7 @@ class StreamDiffVSRPipeline:
                 guidance_scale=guidance_scale,
                 controlnet_conditioning_scale=controlnet_conditioning_scale,
                 force_flow_on_lq=force_flow_on_lq,
+                disable_tpm=disable_tpm,
             )
 
             hq_frames.append(hq_frame)
