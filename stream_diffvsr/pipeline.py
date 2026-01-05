@@ -340,11 +340,19 @@ class StreamDiffVSRPipeline:
             # Check if U-Net expects concatenated input
             unet_in_channels = getattr(self.unet.config, 'in_channels', 4)
             if unet_in_channels > self.config.latent_channels:
-                # Encode LQ to latent space for concatenation
-                lq_latent = self.vae.encode(lq_upscaled_normalized)
-                if do_cfg:
-                    lq_latent = torch.cat([lq_latent] * 2)
-                latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)
+                if unet_in_channels == 7:
+                    # Concatenate LQ image (pixel space) directly
+                    # Valid when latent_scale == scale_factor (both 4), so LQ size == Latent size
+                    cond_input = lq_normalized
+                    if do_cfg:
+                        cond_input = torch.cat([cond_input] * 2)
+                    latent_model_input = torch.cat([latent_model_input, cond_input], dim=1)
+                else:
+                    # Generic case (e.g. 8 channels): Encode LQ to latent space
+                    lq_latent = self.vae.encode(lq_upscaled_normalized)
+                    if do_cfg:
+                        lq_latent = torch.cat([lq_latent] * 2)
+                    latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)
 
             # ControlNet (temporal guidance from warped previous HQ)
             if warped_prev_hq is not None and not state.frame_index == 0:
