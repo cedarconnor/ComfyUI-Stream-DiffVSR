@@ -248,6 +248,12 @@ class StreamDiffVSRPipeline:
             )
         else:
             lq_upscaled = lq_upscaled.to(self.device, self.dtype)
+            # Ensure lq_upscaled matches expected target size
+            _, _, up_h, up_w = lq_upscaled.shape
+            if up_h != target_h or up_w != target_w:
+                lq_upscaled = F.interpolate(
+                    lq_upscaled, size=(target_h, target_w), mode='bicubic', align_corners=False
+                )
         
         lq_upscaled_normalized = normalize_to_neg1_1(lq_upscaled)
 
