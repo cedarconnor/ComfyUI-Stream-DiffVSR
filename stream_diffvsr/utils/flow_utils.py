@@ -60,6 +60,9 @@ def flow_warp(
         # (B, 2, H, W) -> (B, H, W, 2)
         flow = flow.permute(0, 2, 3, 1)
 
+    # Cast flow to match input dtype (RAFT outputs float32, input may be float16)
+    flow = flow.to(dtype=x.dtype, device=x.device)
+
     assert x.size()[-2:] == flow.size()[1:3], \
         f"Image size {x.size()[-2:]} doesn't match flow size {flow.size()[1:3]}"
     

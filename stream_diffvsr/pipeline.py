@@ -18,7 +18,7 @@ from typing import Optional, Tuple, Callable, List, Union
 from dataclasses import dataclass, field
 
 from .state import StreamDiffVSRState
-from .utils.image_utils import bhwc_to_bchw, bchw_to_bhwc, normalize_to_neg1_1, denormalize_from_neg1_1
+from .utils.image_utils import bhwc_to_bchw, bchw_to_bhwc, normalize_to_neg1_1, denormalize_from_neg1_1, pad_to_multiple, crop_to_size
 from .utils.flow_utils import flow_warp
 
 
@@ -223,6 +223,17 @@ class StreamDiffVSRPipeline:
         B, H, W, C = lq_frame.shape
         scale = self.config.scale_factor
         target_h, target_w = H * scale, W * scale
+        
+        # Warn if sizes aren't multiples of latent_scale (8)
+        # This can cause output size mismatches with the bicubic guide
+        latent_scale = self.config.latent_scale
+        if target_h % latent_scale != 0 or target_w % latent_scale != 0:
+            import warnings
+            warnings.warn(
+                f"Input size {H}x{W} (target {target_h}x{target_w}) is not a multiple of {latent_scale}. "
+                f"This may cause slight output size mismatches. Consider resizing input to multiples of {latent_scale // scale}.",
+                UserWarning
+            )
 
         # Convert to model format (BCHW, [-1, 1])
         lq_bchw = bhwc_to_bchw(lq_frame).to(self.device, self.dtype)

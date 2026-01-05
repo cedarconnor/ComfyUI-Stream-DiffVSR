@@ -155,9 +155,9 @@ def save_frames_to_video(
         ]
         
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        proc.stdin.write(frames_np.tobytes())
-        proc.stdin.close()
-        proc.wait()
+        _, stderr = proc.communicate(input=frames_np.tobytes())
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg encoding failed: {stderr.decode('utf-8', errors='replace')}")
         
         # Concat original with new frames
         concat_list = output_path + ".concat.txt"
@@ -201,9 +201,9 @@ def save_frames_to_video(
         ]
         
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        proc.stdin.write(frames_np.tobytes())
-        proc.stdin.close()
-        proc.wait()
+        _, stderr = proc.communicate(input=frames_np.tobytes())
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg encoding failed: {stderr.decode('utf-8', errors='replace')}")
 
 
 class StreamDiffVSR_UpscaleVideo:
@@ -424,7 +424,7 @@ class StreamDiffVSR_UpscaleVideo:
                 frames,
                 state=state,
                 num_inference_steps=num_inference_steps,
-                seed=seed + batch_idx,  # Increment seed per batch
+                seed=seed + batch_start,  # Use global frame index for deterministic output
                 guidance_scale=guidance_scale,
                 controlnet_conditioning_scale=controlnet_scale,
             )

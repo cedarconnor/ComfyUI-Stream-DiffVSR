@@ -137,3 +137,69 @@ def resize_to_multiple(
         tensor = bchw_to_bhwc(tensor)
 
     return tensor
+
+
+def pad_to_multiple(
+    tensor: torch.Tensor,
+    multiple: int = 8,
+    format: str = "BCHW",
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """
+    Pad tensor so height and width are multiples of given value.
+    
+    Unlike resize_to_multiple, this preserves exact pixel values and
+    returns the original size for cropping back later.
+
+    Args:
+        tensor: Input tensor
+        multiple: Target multiple (default 8 for VAE/latent space)
+        format: "BHWC" or "BCHW"
+
+    Returns:
+        (padded_tensor, original_size) where original_size is (H, W)
+    """
+    import torch.nn.functional as F
+
+    if format == "BHWC":
+        h, w = tensor.shape[1], tensor.shape[2]
+        tensor = bhwc_to_bchw(tensor)
+        was_bhwc = True
+    else:
+        h, w = tensor.shape[2], tensor.shape[3]
+        was_bhwc = False
+
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+
+    if pad_h > 0 or pad_w > 0:
+        # Pad right and bottom (reflect padding for better quality)
+        tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode='reflect')
+
+    if was_bhwc:
+        tensor = bchw_to_bhwc(tensor)
+
+    return tensor, (h, w)
+
+
+def crop_to_size(
+    tensor: torch.Tensor,
+    size: Tuple[int, int],
+    format: str = "BCHW",
+) -> torch.Tensor:
+    """
+    Crop tensor back to original size after padding.
+
+    Args:
+        tensor: Padded tensor
+        size: Original (H, W) to crop to
+        format: "BHWC" or "BCHW"
+
+    Returns:
+        Cropped tensor matching original dimensions
+    """
+    h, w = size
+    if format == "BHWC":
+        return tensor[:, :h, :w, :]
+    else:
+        return tensor[:, :, :h, :w]
+
