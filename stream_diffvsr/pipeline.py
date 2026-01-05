@@ -303,6 +303,8 @@ class StreamDiffVSRPipeline:
                 dec_temporal_features = None
 
         # Prepare initial latents
+        # DEBUG: trace sizes
+        print(f"[DEBUG] lq_frame.shape: {lq_frame.shape}, target: {target_h}x{target_w}, lq_upscaled: {lq_upscaled.shape}")
         latents = self._prepare_latents(B, target_h, target_w, generator)
 
         # Get prompt embeddings (empty for unconditional)
