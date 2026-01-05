@@ -276,20 +276,23 @@ RETURN_TYPES = ("STREAM_DIFFVSR_PIPE",)
 INPUT_TYPES = {
     "required": {
         "pipe": ("STREAM_DIFFVSR_PIPE",),
-        "video_path": ("STRING",),
     },
     "optional": {
+        "video_path": ("STRING", {"default": ""}),  # File Mode
+        "images": ("IMAGE",),                      # Tensor Mode
         "output_path": ("STRING", {"default": ""}),
         "frames_per_batch": ("INT", {"default": 16}),
         "start_frame": ("INT", {"default": 0}),
-        "end_frame": ("INT", {"default": -1}),  # -1 = all
+        "end_frame": ("INT", {"default": -1}),
         "num_inference_steps": ("INT", {"default": 4}),
         "seed": ("INT", {"default": 0}),
+        "force_flow_on_lq": ("BOOLEAN", {"default": False}),  # Speed optimization
     }
 }
-RETURN_TYPES = ("STRING",)  # Output video path
+RETURN_TYPES = ("IMAGE", "STRING")
+RETURN_NAMES = ("images", "output_path")
 OUTPUT_NODE = True
-# All-in-one video processing with automatic chunking
+# All-in-one video processing with automatic chunking (supports File or Tensor input)
 ```
 
 ### StreamDiffVSR_Upscale
@@ -303,6 +306,7 @@ INPUT_TYPES = {
         "state": ("STREAM_DIFFVSR_STATE",),
         "num_inference_steps": ("INT", {"default": 4}),
         "seed": ("INT", {"default": 0}),
+        "force_flow_on_lq": ("BOOLEAN", {"default": False}),  # Speed optimization
     }
 }
 RETURN_TYPES = ("IMAGE", "STREAM_DIFFVSR_STATE")

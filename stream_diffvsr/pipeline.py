@@ -200,6 +200,7 @@ class StreamDiffVSRPipeline:
         seed: int = 0,
         guidance_scale: float = 0.0,
         controlnet_conditioning_scale: float = 1.0,
+        force_flow_on_lq: bool = False,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
         Process a single frame with ControlNet temporal guidance.
@@ -213,6 +214,7 @@ class StreamDiffVSRPipeline:
             seed: Random seed
             guidance_scale: CFG scale (0 = no CFG, as per upstream)
             controlnet_conditioning_scale: ControlNet strength
+            force_flow_on_lq: If True, compute flow on LQ frames (faster). If False, compute on HQ (better quality).
 
         Returns:
             hq_frame: High-quality output frame (1, H*4, W*4, C) BHWC
@@ -258,8 +260,31 @@ class StreamDiffVSRPipeline:
 
             # Compute flow if not provided
             if flow is None:
-                prev_lq_upscaled = state.previous_lq_upscaled.to(self.device, self.dtype)
-                flow = self.flow_estimator(lq_upscaled, prev_lq_upscaled)
+                if force_flow_on_lq:
+                    # Compute flow on LQ frames (fast)
+                    if state.previous_lq_upscaled is not None:
+                         # Use raw LQ (ensure range [0, 255] for RAFT)
+                         # lq_bchw is normalized [-1, 1]. RAFT FlowEstimator handles normalization if range is [-1, 1].
+                         
+                         # Previous LQ needs to be derived from upscaled version (since we don't store raw LQ in state)
+                         # Downsampling is fast.
+                         prev_lq = F.interpolate(state.previous_lq_upscaled.to(self.device, self.dtype), 
+                                                scale_factor=1/self.config.scale_factor, mode='bilinear')
+                         
+                         # Current LQ
+                         curr_lq = lq_bchw
+                         
+                         flow_lq = self.flow_estimator(curr_lq, prev_lq)
+                         
+                         # Upscale flow to HQ resolution
+                         from .utils.flow_utils import upscale_flow
+                         flow = upscale_flow(flow_lq, scale_factor=self.config.scale_factor)
+                    else:
+                        flow = torch.zeros(B, 2, target_h, target_w, device=self.device, dtype=self.dtype)
+                else:
+                    # Compute flow on Upscaled LQ frames (slow, standard)
+                    prev_lq_upscaled = state.previous_lq_upscaled.to(self.device, self.dtype)
+                    flow = self.flow_estimator(lq_upscaled, prev_lq_upscaled)
 
             # Warp previous HQ to current frame
             warped_prev_hq = flow_warp(prev_hq, flow, interp_mode='bilinear')
@@ -391,6 +416,7 @@ class StreamDiffVSRPipeline:
         seed: int = 0,
         guidance_scale: float = 0.0,
         controlnet_conditioning_scale: float = 1.0,
+        force_flow_on_lq: bool = False,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
@@ -467,6 +493,7 @@ class StreamDiffVSRPipeline:
                 seed=seed + i,
                 guidance_scale=guidance_scale,
                 controlnet_conditioning_scale=controlnet_conditioning_scale,
+                force_flow_on_lq=force_flow_on_lq,
             )
 
             hq_frames.append(hq_frame)

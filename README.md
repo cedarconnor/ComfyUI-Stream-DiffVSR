@@ -55,26 +55,29 @@ Initializes the model pipeline.
 - **dtype**: Precision (`float16` for GPUs, `float32` for CPU).
 
 ### StreamDiffVSR_UpscaleVideo ⭐ (Recommended)
-**All-in-one node for processing entire video files.**
+**All-in-one node for processing videos (File or Tensor).**
 
-This is the recommended node for most use cases. It automatically:
-- Reads frames from the input video
-- Processes in batches to manage VRAM
-- Maintains temporal consistency across batches
-- Writes results to output video
+This node supports two modes:
+1. **File Mode**: Reads/writes directly to disk (Low RAM, infinite length).
+2. **Tensor Mode**: Compatible with standard ComfyUI `Load Video`/`Save Video`.
+
+**Features:**
+- Automatic chunking (manages VRAM)
+- Temporal state continuity
+- Supports both file paths and IMAGE tensors
 
 **Inputs:**
 - **pipe**: Connection from `StreamDiffVSR_Loader`
-- **video_path**: Path to input video file
+- **video_path** (Optional): Path to input file (File Mode)
+- **images** (Optional): Input frames tensor (Tensor Mode)
 
 **Parameters:**
-- **output_path**: Where to save the result (auto-generated if empty)
-- **frames_per_batch**: Frames to process per batch (default: `16`). Lower = less VRAM.
+- **output_path**: Output path (File Mode only)
+- **frames_per_batch**: Frames to process per chunk (default: `16`). 
 - **start_frame/end_frame**: Frame range to process
 - **num_inference_steps**: Denoising steps (default: `4`)
-- **seed**: Random seed for reproducibility
 
-> **Note:** Audio is not copied. Use ffmpeg to merge audio from original video.
+> **Note:** For Tensor Mode, ensure you have enough system RAM to hold the entire upscaled video. For very long videos, use File Mode.
 
 ### StreamDiffVSR_Upscale
 Upscale a batch of frames from memory (IMAGE tensor input).

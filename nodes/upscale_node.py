@@ -88,6 +88,16 @@ class StreamDiffVSR_Upscale:
                         "tooltip": "ControlNet conditioning strength for temporal guidance.",
                     },
                 ),
+                "force_flow_on_lq": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Compute optical flow on low-res frames. "
+                            "Much faster and saves VRAM, with minimal quality loss."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -106,6 +116,7 @@ class StreamDiffVSR_Upscale:
         seed: int = 0,
         guidance_scale: float = 0.0,
         controlnet_scale: float = 1.0,
+        force_flow_on_lq: bool = False,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
         Upscale video frames.
@@ -139,6 +150,7 @@ class StreamDiffVSR_Upscale:
             seed=seed,
             guidance_scale=guidance_scale,
             controlnet_conditioning_scale=controlnet_scale,
+            force_flow_on_lq=force_flow_on_lq,
             progress_callback=progress,
         )
 
