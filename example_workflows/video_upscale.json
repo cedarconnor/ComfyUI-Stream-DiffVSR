@@ -1,0 +1,100 @@
+{
+    "last_node_id": 2,
+    "last_link_id": 1,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "StreamDiffVSR_Loader",
+            "pos": [
+                50,
+                100
+            ],
+            "size": [
+                250,
+                100
+            ],
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "pipe",
+                    "type": "STREAM_DIFFVSR_PIPE",
+                    "links": [
+                        1
+                    ]
+                }
+            ],
+            "title": "Load Model",
+            "properties": {},
+            "widgets_values": [
+                "v1",
+                "auto",
+                "float16",
+                "true",
+                "true"
+            ]
+        },
+        {
+            "id": 2,
+            "type": "StreamDiffVSR_UpscaleVideo",
+            "pos": [
+                350,
+                100
+            ],
+            "size": [
+                350,
+                280
+            ],
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "pipe",
+                    "type": "STREAM_DIFFVSR_PIPE",
+                    "link": 1
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "output_path",
+                    "type": "STRING",
+                    "links": null
+                }
+            ],
+            "title": "Upscale Video 4x",
+            "properties": {},
+            "widgets_values": [
+                "C:/path/to/your/video.mp4",
+                "",
+                16,
+                0,
+                -1,
+                4,
+                0,
+                0.0,
+                1.0
+            ]
+        }
+    ],
+    "links": [
+        [
+            1,
+            1,
+            0,
+            2,
+            0,
+            "STREAM_DIFFVSR_PIPE"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "ds": {
+            "scale": 1,
+            "offset": [
+                0,
+                0
+            ]
+        },
+        "info": "Simple video upscale workflow. Just set the video_path to your input video and run! Output will be saved with _4x suffix in ComfyUI output folder."
+    },
+    "version": 0.4
+}

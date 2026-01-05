@@ -17,7 +17,7 @@ Copyright 2026 Cedar (ComfyUI integration)
 from .nodes import (
     StreamDiffVSR_Loader,
     StreamDiffVSR_Upscale,
-    StreamDiffVSR_ProcessFrame,
+    StreamDiffVSR_UpscaleVideo,
     StreamDiffVSR_CreateState,
     StreamDiffVSR_ExtractState,
 )
@@ -26,15 +26,15 @@ from .nodes import (
 NODE_CLASS_MAPPINGS = {
     "StreamDiffVSR_Loader": StreamDiffVSR_Loader,
     "StreamDiffVSR_Upscale": StreamDiffVSR_Upscale,
-    "StreamDiffVSR_ProcessFrame": StreamDiffVSR_ProcessFrame,
+    "StreamDiffVSR_UpscaleVideo": StreamDiffVSR_UpscaleVideo,
     "StreamDiffVSR_CreateState": StreamDiffVSR_CreateState,
     "StreamDiffVSR_ExtractState": StreamDiffVSR_ExtractState,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StreamDiffVSR_Loader": "Load Stream-DiffVSR Model",
-    "StreamDiffVSR_Upscale": "Stream-DiffVSR Upscale",
-    "StreamDiffVSR_ProcessFrame": "Process Single Frame (Advanced)",
+    "StreamDiffVSR_Upscale": "Stream-DiffVSR Upscale (Batch)",
+    "StreamDiffVSR_UpscaleVideo": "Stream-DiffVSR Upscale Video",
     "StreamDiffVSR_CreateState": "Create Empty State",
     "StreamDiffVSR_ExtractState": "Extract State Info",
 }
@@ -42,4 +42,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 # Version info
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -58,9 +58,9 @@ stream_diffvsr/models/
 
 ```
 # requirements.txt
-torch>=2.0.0,<2.5.0
-torchvision>=0.15.0,<0.20.0
-diffusers>=0.25.0,<0.32.0
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.30.0,<0.32.0
 transformers>=4.30.0,<5.0.0
 safetensors>=0.4.0,<1.0.0
 accelerate>=0.20.0,<1.0.0
@@ -182,17 +182,22 @@ class TemporalVAE:
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 class FlowEstimator:
-    """RAFT-Large optical flow estimator."""
+    """RAFT-Large optical flow estimator with automatic tiled fallback."""
     
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', tile_size=512, tile_overlap=128):
         self.model = raft_large(weights=Raft_Large_Weights.DEFAULT)
         self.model = self.model.to(device).eval()
         self.model.requires_grad_(False)
+        self.tile_size = tile_size
+        self.tile_overlap = tile_overlap
     
     def __call__(self, target, source):
-        """Estimate flow from source to target."""
-        flows = self.model(target, source)
-        return flows[-1].permute(0, 2, 3, 1)  # (B, H, W, 2)
+        """Estimate flow from source to target. Auto-tiles on OOM."""
+        try:
+            flows = self.model(target, source)
+            return flows[-1].permute(0, 2, 3, 1)  # (B, H, W, 2)
+        except torch.cuda.OutOfMemoryError:
+            return self.forward_tiled(target, source)
 ```
 
 ---
@@ -421,7 +426,7 @@ print('Single frame test passed')
 |------|------------|
 | TemporalAutoencoderTiny not in diffusers | Vendor from upstream with minimal changes |
 | HuggingFace model format differs | Test loading early, adapt as needed |
-| VRAM usage higher than expected | Implement tiling as Phase 2 optimization |
+| VRAM usage higher than expected | **IMPLEMENTED**: FlowEstimator auto-tiles on OOM |
 | diffusers version incompatibility | Pin versions in requirements.txt |
 
 ---

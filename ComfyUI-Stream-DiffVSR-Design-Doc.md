@@ -11,6 +11,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.2 | Jan 2026 | **Tiling implementation** - FlowEstimator auto-tiles on OOM (Section 11) |
 | 1.1 | Jan 2026 | **Post-review revision** addressing Gemini/ChatGPT feedback |
 | 1.0 | Jan 2026 | Initial design document |
 
@@ -125,7 +126,7 @@ try:
             f"Stream-DiffVSR is tested with diffusers>=0.25.0"
         )
 except ImportError:
-    raise ImportError("diffusers is required. Install with: pip install diffusers>=0.25.0")
+    raise ImportError("diffusers is required. Install with: pip install diffusers>=0.30.0,<0.32.0")
 ```
 
 ---
@@ -141,7 +142,7 @@ except ImportError:
 
 ### Secondary Goals
 
-- [ ] VRAM optimization through optional tiling
+- [x] VRAM optimization through automatic flow tiling (implemented Jan 2026)
 - [ ] VHS (Video Helper Suite) integration for seamless video workflows
 - [ ] TensorRT acceleration path (optional)
 - [ ] Multi-GPU support for long video processing

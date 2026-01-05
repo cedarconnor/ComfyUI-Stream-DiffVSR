@@ -1,0 +1,188 @@
+{
+    "last_node_id": 4,
+    "last_link_id": 3,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "StreamDiffVSR_Loader",
+            "pos": [
+                50,
+                200
+            ],
+            "size": [
+                250,
+                100
+            ],
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "pipe",
+                    "type": "STREAM_DIFFVSR_PIPE",
+                    "links": [
+                        1
+                    ]
+                }
+            ],
+            "properties": {},
+            "widgets_values": [
+                "v1",
+                "auto",
+                "float16",
+                true,
+                true
+            ]
+        },
+        {
+            "id": 2,
+            "type": "LoadImage",
+            "pos": [
+                50,
+                50
+            ],
+            "size": [
+                250,
+                100
+            ],
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "IMAGE",
+                    "type": "IMAGE",
+                    "links": [
+                        2
+                    ]
+                },
+                {
+                    "name": "MASK",
+                    "type": "MASK",
+                    "links": null
+                }
+            ],
+            "title": "Load Single Image",
+            "properties": {},
+            "widgets_values": [
+                "input/your_image.png",
+                "image"
+            ]
+        },
+        {
+            "id": 3,
+            "type": "StreamDiffVSR_Upscale",
+            "pos": [
+                350,
+                100
+            ],
+            "size": [
+                300,
+                200
+            ],
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "pipe",
+                    "type": "STREAM_DIFFVSR_PIPE",
+                    "link": 1
+                },
+                {
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": 2
+                },
+                {
+                    "name": "state",
+                    "type": "STREAM_DIFFVSR_STATE",
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "images",
+                    "type": "IMAGE",
+                    "links": [
+                        3
+                    ]
+                },
+                {
+                    "name": "state",
+                    "type": "STREAM_DIFFVSR_STATE",
+                    "links": null
+                }
+            ],
+            "title": "Upscale 4x (Single Image)",
+            "properties": {},
+            "widgets_values": [
+                4,
+                0,
+                0.0,
+                1.0,
+                false,
+                512,
+                128
+            ]
+        },
+        {
+            "id": 4,
+            "type": "SaveImage",
+            "pos": [
+                700,
+                100
+            ],
+            "size": [
+                250,
+                150
+            ],
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": 3
+                }
+            ],
+            "title": "Save Upscaled Image",
+            "properties": {},
+            "widgets_values": [
+                "upscaled_image"
+            ]
+        }
+    ],
+    "links": [
+        [
+            1,
+            1,
+            0,
+            3,
+            0,
+            "STREAM_DIFFVSR_PIPE"
+        ],
+        [
+            2,
+            2,
+            0,
+            3,
+            1,
+            "IMAGE"
+        ],
+        [
+            3,
+            3,
+            0,
+            4,
+            0,
+            "IMAGE"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "ds": {
+            "scale": 1,
+            "offset": [
+                0,
+                0
+            ]
+        },
+        "info": "Single image upscale workflow. Note: For single images, there is no temporal guidance (first frame mode). The result is still high quality diffusion upscaling."
+    },
+    "version": 0.4
+}

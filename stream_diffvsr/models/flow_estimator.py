@@ -14,16 +14,20 @@ from typing import Optional, Tuple
 
 class FlowEstimator(nn.Module):
     """
-    RAFT-Large optical flow estimator.
+    RAFT-Large optical flow estimator with tiled processing support.
 
     Estimates optical flow between consecutive frames for temporal alignment.
     The flow is computed on bicubic-upscaled 4x images (not LQ resolution).
+    
+    For high-resolution inputs, uses tiled processing to avoid OOM errors.
     """
 
     def __init__(
         self,
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
+        tile_size: int = 512,
+        tile_overlap: int = 128,
     ):
         """
         Initialize RAFT-Large flow estimator.
@@ -31,6 +35,8 @@ class FlowEstimator(nn.Module):
         Args:
             device: Target device (default: cuda if available)
             dtype: Model dtype (RAFT works best in float32)
+            tile_size: Default tile size for tiled processing
+            tile_overlap: Default overlap between tiles (larger = better quality)
         """
         super().__init__()
         
@@ -38,6 +44,8 @@ class FlowEstimator(nn.Module):
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
         self.dtype = dtype
+        self.tile_size = tile_size
+        self.tile_overlap = tile_overlap
 
         # Load RAFT-Large from torchvision
         try:
@@ -51,20 +59,172 @@ class FlowEstimator(nn.Module):
                 "Install with: pip install torchvision>=0.15.0"
             )
 
+    def _to_255_range(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Convert tensor to [0, 255] range for RAFT."""
+        if tensor.min() < 0:
+            # [-1, 1] range
+            return ((tensor + 1) / 2 * 255).clamp(0, 255)
+        elif tensor.max() <= 1:
+            # [0, 1] range
+            return (tensor * 255).clamp(0, 255)
+        else:
+            # Already in [0, 255]
+            return tensor
+
+    def _compute_flow_single(
+        self,
+        target_255: torch.Tensor,
+        source_255: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute flow for a single pair (internal, expects 255 range)."""
+        flows = self.model(target_255, source_255)
+        return flows[-1]  # Best prediction (B, 2, H, W)
+
+    def _get_tile_coords(
+        self,
+        height: int,
+        width: int,
+        tile_size: int,
+        overlap: int,
+    ) -> list:
+        """Generate tile coordinates with overlap."""
+        tiles = []
+        stride = tile_size - overlap
+
+        # Generate y coordinates
+        y = 0
+        while y < height:
+            y_end = min(y + tile_size, height)
+            # Generate x coordinates
+            x = 0
+            while x < width:
+                x_end = min(x + tile_size, width)
+                tiles.append((y, y_end, x, x_end))
+                if x_end == width:
+                    break
+                x += stride
+            if y_end == height:
+                break
+            y += stride
+
+        return tiles
+
+    def _create_feather_mask(
+        self,
+        tile_h: int,
+        tile_w: int,
+        overlap: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Create feathering mask for blending tiles."""
+        mask = torch.ones(1, 1, tile_h, tile_w, device=device, dtype=dtype)
+
+        if overlap <= 0:
+            return mask
+
+        # Create linear ramps for edges
+        ramp = torch.linspace(0, 1, overlap, device=device, dtype=dtype)
+
+        # Apply to all edges (be careful with small tiles)
+        if tile_h > overlap:
+            mask[:, :, :overlap, :] *= ramp.view(1, 1, -1, 1)
+            mask[:, :, -overlap:, :] *= ramp.flip(0).view(1, 1, -1, 1)
+        if tile_w > overlap:
+            mask[:, :, :, :overlap] *= ramp.view(1, 1, 1, -1)
+            mask[:, :, :, -overlap:] *= ramp.flip(0).view(1, 1, 1, -1)
+
+        return mask
+
+    @torch.inference_mode()
+    def forward_tiled(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        tile_size: int = None,
+        overlap: int = None,
+    ) -> torch.Tensor:
+        """
+        Compute optical flow using tiled processing.
+
+        This method is used for high-resolution inputs that would OOM
+        with full-frame processing.
+
+        Args:
+            target: Target frame (B, C, H, W) - current frame
+            source: Source frame (B, C, H, W) - previous frame
+            tile_size: Tile size (default: self.tile_size)
+            overlap: Overlap between tiles (default: self.tile_overlap)
+
+        Returns:
+            Flow field (B, H, W, 2) in pixel coordinates
+        """
+        tile_size = tile_size or self.tile_size
+        overlap = overlap or self.tile_overlap
+
+        target = target.to(self.device, self.dtype)
+        source = source.to(self.device, self.dtype)
+
+        B, C, H, W = target.shape
+
+        # Convert to 255 range
+        target_255 = self._to_255_range(target)
+        source_255 = self._to_255_range(source)
+
+        # Get tile coordinates
+        tiles = self._get_tile_coords(H, W, tile_size, overlap)
+        print(f'[Stream-DiffVSR] Computing flow in {len(tiles)} tiles ({tile_size}px, {overlap}px overlap)')
+
+        # Accumulate flow and weights
+        flow_accum = torch.zeros(B, 2, H, W, device=self.device, dtype=self.dtype)
+        weight_accum = torch.zeros(1, 1, H, W, device=self.device, dtype=self.dtype)
+
+        for i, (y1, y2, x1, x2) in enumerate(tiles):
+            # Extract tiles
+            target_tile = target_255[:, :, y1:y2, x1:x2]
+            source_tile = source_255[:, :, y1:y2, x1:x2]
+
+            # Compute flow for this tile
+            tile_flow = self._compute_flow_single(target_tile, source_tile)
+
+            # Create feather mask
+            tile_h, tile_w = y2 - y1, x2 - x1
+            mask = self._create_feather_mask(tile_h, tile_w, overlap, self.device, self.dtype)
+
+            # Accumulate with feathering
+            flow_accum[:, :, y1:y2, x1:x2] += tile_flow * mask
+            weight_accum[:, :, y1:y2, x1:x2] += mask
+
+        # Normalize by weights
+        flow = flow_accum / weight_accum.clamp(min=1e-8)
+
+        # Convert to (B, H, W, 2) format
+        flow = flow.permute(0, 2, 3, 1)
+
+        return flow
+
     @torch.inference_mode()
     def forward(
         self,
         target: torch.Tensor,
         source: torch.Tensor,
         rescale_factor: int = 1,
+        enable_tiling: bool = True,
+        tile_size: int = None,
+        tile_overlap: int = None,
     ) -> torch.Tensor:
         """
         Estimate optical flow from source to target.
+
+        Automatically falls back to tiled processing if full-frame OOMs.
 
         Args:
             target: Target frame (B, C, H, W) - current frame
             source: Source frame (B, C, H, W) - previous frame
             rescale_factor: Optional downscale factor for flow computation
+            enable_tiling: Whether to allow tiled fallback on OOM
+            tile_size: Tile size for tiled processing
+            tile_overlap: Overlap for tiled processing
 
         Returns:
             Flow field (B, H, W, 2) in pixel coordinates
@@ -77,23 +237,23 @@ class FlowEstimator(nn.Module):
         target = target.to(self.device, self.dtype)
         source = source.to(self.device, self.dtype)
 
-        # RAFT expects [0, 255] range, convert from [-1, 1] or [0, 1]
-        if target.min() < 0:
-            # [-1, 1] range
-            target_255 = ((target + 1) / 2 * 255).clamp(0, 255)
-            source_255 = ((source + 1) / 2 * 255).clamp(0, 255)
-        elif target.max() <= 1:
-            # [0, 1] range
-            target_255 = (target * 255).clamp(0, 255)
-            source_255 = (source * 255).clamp(0, 255)
-        else:
-            # Already in [0, 255]
-            target_255 = target
-            source_255 = source
+        # Convert to 255 range
+        target_255 = self._to_255_range(target)
+        source_255 = self._to_255_range(source)
 
-        # Compute flow (returns list of flow predictions, use last one)
-        flows = self.model(target_255, source_255)
-        flow = flows[-1]  # Best prediction
+        # Try full-frame first, fall back to tiled on OOM
+        try:
+            flow = self._compute_flow_single(target_255, source_255)
+        except torch.cuda.OutOfMemoryError:
+            if not enable_tiling:
+                raise
+            print('[Stream-DiffVSR] OOM on full-frame flow, switching to tiled processing...')
+            torch.cuda.empty_cache()
+            return self.forward_tiled(
+                target, source,
+                tile_size=tile_size or self.tile_size,
+                overlap=tile_overlap or self.tile_overlap,
+            )
 
         # Optionally rescale flow
         if rescale_factor != 1:

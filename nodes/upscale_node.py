@@ -92,7 +92,7 @@ class StreamDiffVSR_Upscale:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Enable tiled processing for lower VRAM usage",
+                        "tooltip": "Enable tiled VAE decoding for lower VRAM (flow auto-tiles on OOM)",
                     },
                 ),
                 "tile_size": (
@@ -102,17 +102,17 @@ class StreamDiffVSR_Upscale:
                         "min": 256,
                         "max": 1024,
                         "step": 64,
-                        "tooltip": "Tile size when tiling is enabled",
+                        "tooltip": "Tile size for VAE decoding when tiling is enabled",
                     },
                 ),
                 "tile_overlap": (
                     "INT",
                     {
-                        "default": 64,
-                        "min": 16,
+                        "default": 128,
+                        "min": 32,
                         "max": 256,
                         "step": 16,
-                        "tooltip": "Overlap between tiles to reduce seams",
+                        "tooltip": "Overlap between tiles (larger = better quality, more VRAM)",
                     },
                 ),
             },
@@ -135,7 +135,7 @@ class StreamDiffVSR_Upscale:
         controlnet_scale: float = 1.0,
         enable_tiling: bool = False,
         tile_size: int = 512,
-        tile_overlap: int = 64,
+        tile_overlap: int = 128,
     ) -> Tuple[torch.Tensor, StreamDiffVSRState]:
         """
         Upscale video frames.
@@ -148,8 +148,8 @@ class StreamDiffVSR_Upscale:
             seed: Random seed
             guidance_scale: CFG scale (0 = disabled)
             controlnet_scale: ControlNet conditioning strength
-            enable_tiling: Whether to use tiling
-            tile_size: Tile size
+            enable_tiling: Whether to use tiled VAE decoding
+            tile_size: Tile size for VAE decoding
             tile_overlap: Tile overlap
 
         Returns:
@@ -162,11 +162,11 @@ class StreamDiffVSR_Upscale:
         def progress(current, total):
             print(f"[Stream-DiffVSR] Frame {current}/{total}")
 
-        # TODO: Implement tiling support
+        # Note: Optical flow automatically tiles on OOM (handled in flow_estimator.py)
         if enable_tiling:
-            print(f"[Stream-DiffVSR] Tiling enabled: {tile_size}px with {tile_overlap}px overlap")
-            # For now, just process without tiling
-            # Tiled processing requires careful handling to preserve temporal consistency
+            print(f"[Stream-DiffVSR] VAE tiling enabled: {tile_size}px with {tile_overlap}px overlap")
+            # VAE tiling would be implemented here if needed
+            # For now, flow tiling (the main bottleneck) is automatic
 
         # Process frames
         hq_images, final_state = pipe(

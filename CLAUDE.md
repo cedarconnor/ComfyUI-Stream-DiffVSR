@@ -27,7 +27,7 @@ Stream-DiffVSR = 4-step diffusion VSR with temporal feedback
 | **Temporal Guidance** | `ControlNetModel` (diffusers) | Takes warped previous HQ as conditioning |
 | **U-Net** | `UNet2DConditionModel` (diffusers) | SD x4 Upscaler base, distilled for 4-step |
 | **Temporal VAE** | `TemporalAutoencoderTiny` | Custom VAE with TPM for temporal fusion |
-| **Flow Estimator** | `raft_large` (torchvision) | RAFT-Large, NOT RAFT-Small |
+| **Flow Estimator** | `raft_large` (torchvision) | RAFT-Large with automatic tiled fallback on OOM |
 | **Scheduler** | `DDIMScheduler` (diffusers) | Standard DDIM, 4 steps default |
 
 ### Inference Flow (from upstream)
@@ -194,15 +194,16 @@ flow = estimate_flow(upscaled_current, upscaled_prev)
 Tiling breaks temporal consistency because flow/warping must be computed on full frames.
 
 ```python
-# WRONG - tile everything
+# WRONG - tile everything including flow
 for tile in tiles:
     flow_tile = estimate_flow(lq_tile, prev_lq_tile)  # Discontinuous!
 
-# CORRECT - flow on full frame, tile only diffusion
-flow = estimate_flow(lq_full, prev_lq_full)
-warped_hq = warp(prev_hq_full, flow)
-for tile in tiles:
-    process_diffusion_tile(...)
+# CORRECT - flow auto-tiles with overlap blending on OOM
+# The FlowEstimator automatically handles this:
+try:
+    flow = estimate_flow(lq_full, prev_lq_full)  # Try full frame
+except OOM:
+    flow = estimate_flow_tiled(lq_full, prev_lq_full)  # Auto-fallback
 ```
 
 ### ❌ State Serialization via Lists
@@ -223,7 +224,6 @@ ComfyUI-Stream-DiffVSR/
 ├── __init__.py                 # Node registration + version check
 ├── CLAUDE.md                   # This file
 ├── LICENSE                     # Apache-2.0
-├── NOTICE                      # Attribution to upstream authors
 ├── README.md
 ├── requirements.txt
 ├── pyproject.toml
@@ -231,8 +231,8 @@ ComfyUI-Stream-DiffVSR/
 ├── nodes/
 │   ├── __init__.py
 │   ├── loader_node.py          # StreamDiffVSR_Loader
-│   ├── upscale_node.py         # StreamDiffVSR_Upscale (main)
-│   ├── process_frame_node.py   # StreamDiffVSR_ProcessFrame (advanced)
+│   ├── upscale_node.py         # StreamDiffVSR_Upscale (batch processing)
+│   ├── video_upscale_node.py   # StreamDiffVSR_UpscaleVideo (all-in-one)
 │   └── state_nodes.py          # CreateState, ExtractState
 
 ├── stream_diffvsr/
@@ -247,7 +247,7 @@ ComfyUI-Stream-DiffVSR/
 │   │   ├── unet.py             # UNet2DConditionModel wrapper
 │   │   ├── controlnet.py       # ControlNet for temporal guidance
 │   │   ├── temporal_vae.py     # TemporalAutoencoderTiny wrapper
-│   │   └── flow_estimator.py   # RAFT-Large wrapper
+│   │   └── flow_estimator.py   # RAFT-Large with auto-tiling
 │   │
 │   ├── schedulers/
 │   │   └── ddim.py             # DDIMScheduler (from diffusers)
@@ -255,12 +255,12 @@ ComfyUI-Stream-DiffVSR/
 │   └── utils/
 │       ├── image_utils.py      # Tensor conversions
 │       ├── flow_utils.py       # Warp operations
-│       ├── tiling.py           # Temporal-aware tiling
+│       ├── tiling.py           # Temporal-aware tiling utilities
 │       └── device_utils.py     # Device/dtype management
 
 └── example_workflows/
-    ├── basic_upscale.json
-    └── vhs_integration.json
+    ├── video_upscale.json      # Simple all-in-one workflow
+    └── single_image_upscale.json
 ```
 
 ## Node Signatures
@@ -269,6 +269,27 @@ ComfyUI-Stream-DiffVSR/
 ```python
 RETURN_TYPES = ("STREAM_DIFFVSR_PIPE",)
 # Loads all model components from HuggingFace, returns pipeline object
+```
+
+### StreamDiffVSR_UpscaleVideo (Recommended)
+```python
+INPUT_TYPES = {
+    "required": {
+        "pipe": ("STREAM_DIFFVSR_PIPE",),
+        "video_path": ("STRING",),
+    },
+    "optional": {
+        "output_path": ("STRING", {"default": ""}),
+        "frames_per_batch": ("INT", {"default": 16}),
+        "start_frame": ("INT", {"default": 0}),
+        "end_frame": ("INT", {"default": -1}),  # -1 = all
+        "num_inference_steps": ("INT", {"default": 4}),
+        "seed": ("INT", {"default": 0}),
+    }
+}
+RETURN_TYPES = ("STRING",)  # Output video path
+OUTPUT_NODE = True
+# All-in-one video processing with automatic chunking
 ```
 
 ### StreamDiffVSR_Upscale
@@ -285,12 +306,7 @@ INPUT_TYPES = {
     }
 }
 RETURN_TYPES = ("IMAGE", "STREAM_DIFFVSR_STATE")
-```
-
-### StreamDiffVSR_ProcessFrame (Advanced)
-```python
-# Single frame processing with explicit state I/O
-# For custom loops, VHS integration
+# For VHS integration or manual batch workflows
 ```
 
 ## Model Loading
@@ -371,9 +387,9 @@ mypy stream_diffvsr/ --ignore-missing-imports
 ## Dependencies (Known Good)
 
 ```
-torch>=2.0.0,<2.5.0
-torchvision>=0.15.0,<0.20.0
-diffusers>=0.25.0,<0.32.0
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.30.0,<0.32.0
 transformers>=4.30.0,<5.0.0
 safetensors>=0.4.0
 accelerate>=0.20.0
