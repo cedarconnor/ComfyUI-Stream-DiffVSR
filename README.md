@@ -1,3 +1,5 @@
+Very experimental.................................................................
+
 # ComfyUI-Stream-DiffVSR
 
 ComfyUI custom nodes for **Stream-DiffVSR** video super-resolution with temporal consistency.
