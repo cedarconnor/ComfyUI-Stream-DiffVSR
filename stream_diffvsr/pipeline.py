@@ -343,7 +343,9 @@ class StreamDiffVSRPipeline:
             unet_in_channels = getattr(self.unet.config, 'in_channels', 4)
             if unet_in_channels > self.config.latent_channels:
                 # Encode LQ to latent space for concatenation
+                print(f"[DEBUG] Before VAE encode - lq_upscaled_normalized.shape: {lq_upscaled_normalized.shape}")
                 lq_latent = self.vae.encode(lq_upscaled_normalized)
+                print(f"[DEBUG] After VAE encode - lq_latent.shape: {lq_latent.shape}")
                 if do_cfg:
                     lq_latent = torch.cat([lq_latent] * 2)
                 latent_model_input = torch.cat([latent_model_input, lq_latent], dim=1)
