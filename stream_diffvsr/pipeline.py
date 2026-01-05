@@ -510,10 +510,11 @@ class StreamDiffVSRPipeline:
                 flow = None
 
             # Process with temporal guidance
+            # Note: We don't pass lq_upscaled - process_frame computes it to ensure size consistency
             hq_frame, state = self.process_frame(
                 frame,
                 state,
-                lq_upscaled=lq_upscaled,
+                lq_upscaled=None,  # Let process_frame compute to ensure sizes match
                 flow=flow,
                 num_inference_steps=num_inference_steps,
                 seed=seed + i,
