@@ -1,9 +1,9 @@
 # ComfyUI-Stream-DiffVSR Design Document
 
-**Version:** 1.1 (Revised)  
-**Date:** January 2026  
-**Author:** Cedar  
-**Status:** Draft - Post-Review
+**Version:** 1.3 (Implemented)
+**Date:** January 2026
+**Author:** Cedar
+**Status:** Released
 
 ---
 
@@ -11,21 +11,17 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.3 | Jan 2026 | **All-in-One Video Node** - Added `StreamDiffVSR_UpscaleVideo` with auto-chunking |
 | 1.2 | Jan 2026 | **Tiling implementation** - FlowEstimator auto-tiles on OOM (Section 11) |
 | 1.1 | Jan 2026 | **Post-review revision** addressing Gemini/ChatGPT feedback |
 | 1.0 | Jan 2026 | Initial design document |
 
-### Key Changes in v1.1
+### Key Changes in v1.3
 
-2. **VAE encoding fixed** — Removed hardcoded 0.18215 scaling, use config.scaling_factor (Section 8.1)
-3. **State serialization rewritten** — Replaced tensor-to-list with safetensors (Section 9)
-4. **Tensor layout standardized** — All state tensors are BCHW, conversion at I/O boundaries (Section 8.2)
-5. **ARTG injection architecture documented** — Explains why we bypass ComfyUI's sampler (Section 8.0)
-6. **Tiling + temporal consistency** — Critical section on why naive tiling breaks (Section 11.1)
-7. **Optical flow model reuse** — Check for existing RAFT before loading (Section 11.2)
-8. **MVP strategy added** — "Wrap upstream inference" recommended approach (Section 1.1)
-9. **Batch=time convention** — Explicitly documented frame ordering (Section 4)
-10. **Version compatibility** — Defensive imports and known-good versions (Section 13)
+1. **UpscaleVideo Node** — Single node handles video I/O and chunking (Section 7.2)
+2. **Simplified Interface** — Removed confusing manual tiling parameters from Upscale node
+3. **Dependencies** — Fixed conflict with core ComfyUI packages in requirements.txt
+4. **Docs** — Updated README and workflows for better UX
 
 ---
 
@@ -574,84 +570,89 @@ class StreamDiffVSR_Loader:
         pass
 ```
 
-### 7.2 StreamDiffVSR_Upscale
+### 7.2 StreamDiffVSR_UpscaleVideo (Recommended)
 
 **Category:** `🎬 StreamDiffVSR`  
-**Display Name:** `Stream-DiffVSR Upscale`
+**Display Name:** `Stream-DiffVSR Upscale Video`
 
 ```python
-class StreamDiffVSR_Upscale:
+class StreamDiffVSR_UpscaleVideo:
     """
-    Main upscaling node. Processes a batch of frames with auto-regressive
-    temporal guidance.
+    All-in-one video upscaling node.
     
-    For batches, frames are processed sequentially with each frame using
-    the previous frame's HQ output for temporal conditioning.
+    Processes an entire video file with automatic chunking to manage
+    VRAM usage. This is the recommended node for long videos.
     """
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pipe": ("STREAM_DIFFVSR_PIPE", {
-                    "tooltip": "Pipeline from StreamDiffVSR_Loader"
-                }),
-                "images": ("IMAGE", {
-                    "tooltip": "Input frames (BHWC tensor). Batch dimension = frame count."
-                }),
+                "pipe": ("STREAM_DIFFVSR_PIPE", {"tooltip": "Pipeline from StreamDiffVSR_Loader"}),
+                "video_path": ("STRING", {"tooltip": "Path to input video file"}),
             },
             "optional": {
-                "state": ("STREAM_DIFFVSR_STATE", {
-                    "tooltip": "Previous state for continuing a sequence. "
-                               "Leave unconnected to start fresh."
-                }),
-                "num_inference_steps": ("INT", {
-                    "default": 4,
-                    "min": 1,
-                    "max": 50,
-                    "step": 1,
-                    "tooltip": "Denoising steps. Model is optimized for 4 steps."
-                }),
-                "seed": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xffffffffffffffff,
-                    "tooltip": "Random seed for reproducibility"
-                }),
-                "enable_tiling": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable tiled processing for lower VRAM usage"
-                }),
-                "tile_size": ("INT", {
-                    "default": 512,
-                    "min": 256,
-                    "max": 1024,
-                    "step": 64,
-                    "tooltip": "Tile size when tiling is enabled"
-                }),
-                "tile_overlap": ("INT", {
-                    "default": 64,
-                    "min": 16,
-                    "max": 256,
-                    "step": 16,
-                    "tooltip": "Overlap between tiles to reduce seams"
-                }),
+                "output_path": ("STRING", {"default": ""}),
+                "frames_per_batch": ("INT", {"default": 16}),
+                "start_frame": ("INT", {"default": 0}),
+                "end_frame": ("INT", {"default": -1}),
+                "num_inference_steps": ("INT", {"default": 4}),
+                "seed": ("INT", {"default": 0}),
+                "guidance_scale": ("FLOAT", {"default": 0.0}),
+                "controlnet_scale": ("FLOAT", {"default": 1.0}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_path",)
+    FUNCTION = "upscale_video"
+    CATEGORY = "🎬 StreamDiffVSR"
+    OUTPUT_NODE = True
+    
+    def upscale_video(self, pipe, video_path, output_path="", frames_per_batch=16, ...):
+        # Implementation in video_upscale_node.py
+        pass
+```
+
+### 7.3 StreamDiffVSR_Upscale
+
+**Category:** `🎬 StreamDiffVSR`  
+**Display Name:** `Stream-DiffVSR Upscale (Batch)`
+
+```python
+class StreamDiffVSR_Upscale:
+    """
+    Batch upscaling node. Processes a batch of frames from memory.
+    
+    Use this for integration with VHS or custom workflows.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipe": ("STREAM_DIFFVSR_PIPE",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "state": ("STREAM_DIFFVSR_STATE",),
+                "num_inference_steps": ("INT", {"default": 4}),
+                "seed": ("INT", {"default": 0}),
+                "guidance_scale": ("FLOAT", {"default": 0.0}),
+                "controlnet_scale": ("FLOAT", {"default": 1.0}),
             }
         }
     
     RETURN_TYPES = ("IMAGE", "STREAM_DIFFVSR_STATE")
-    RETURN_NAMES = ("images", "state")
     FUNCTION = "upscale"
     CATEGORY = "🎬 StreamDiffVSR"
-    DESCRIPTION = "Upscale video frames 4× with temporal consistency"
     
-    def upscale(self, pipe, images, state=None, num_inference_steps=4, 
-                seed=0, enable_tiling=False, tile_size=512, tile_overlap=64):
-        # Implementation in Section 8
+    def upscale(self, pipe, images, state=None, num_inference_steps=4, seed=0, ...):
+        # Implementation in nodes/upscale_node.py
         pass
 ```
 
-### 7.3 StreamDiffVSR_ProcessFrame (Advanced)
+### 7.4 StreamDiffVSR_ProcessFrame (Advanced)
 
 **Category:** `🎬 StreamDiffVSR/Advanced`  
 **Display Name:** `Process Single Frame`
@@ -691,7 +692,7 @@ class StreamDiffVSR_ProcessFrame:
     CATEGORY = "🎬 StreamDiffVSR/Advanced"
 ```
 
-### 7.4 StreamDiffVSR_CreateState
+### 7.5 StreamDiffVSR_CreateState
 
 **Category:** `🎬 StreamDiffVSR/Advanced`  
 **Display Name:** `Create Empty State`

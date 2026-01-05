@@ -79,7 +79,8 @@ class VRAMError(StreamDiffVSRError):
             msg += f"\nSuggestion: {suggestion}"
         else:
             msg += "\nSuggestions:\n"
-            msg += "  - Enable tiling (enable_tiling=True)\n"
+            msg += "  - Reduce frames_per_batch (for UpscaleVideo node)\n"
+            msg += "  - Reduce batch size (for Upscale node)\n"
             msg += "  - Reduce input resolution\n"
             msg += "  - Use float16 instead of float32"
         super().__init__(msg)
